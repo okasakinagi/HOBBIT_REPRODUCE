@@ -25,8 +25,12 @@ server_hobbit.py — 服务器部署脚本
 """
 
 import sys
-import time
 import os
+
+# --- 必须在任何 huggingface 相关 import 之前设置，否则 Xet 模块已缓存配置 ---
+os.environ.setdefault("HF_HUB_ENABLE_HF_XET", "0")
+
+import time
 from datetime import datetime
 
 import torch
@@ -39,9 +43,6 @@ from transformers import MixtralConfig, MixtralForCausalLM
 # 0. 环境自检
 # ============================================================
 def env_check():
-    # 禁用 Xet 存储（HF-Mirror 不支持，否则报 401 Unauthorized）
-    os.environ.setdefault("HF_HUB_ENABLE_HF_XET", "0")
-
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] START: {sys.argv[0]}")
     print(f"[ENV] Python={sys.version.split()[0]}")
     print(f"[ENV] PyTorch={torch.__version__}")
