@@ -65,27 +65,42 @@ g:\moe\
 - 输入 `[1, 32]` -> 输出 logits `[1, 32, 32000]`
 - FP16 命中率 6.2%，INT4 使用率 50%，跳过率 0%（初始缓存仅 2 个 FP16 专家）
 
-### 阶段3：服务器部署（进行中，模型加载调试中）
+### 阶段3：服务器部署（模型加载卡点，暂停中）
 
 **已完成：**
 - 模型权重下载到服务器本地（`~/models/mixtral-8x7b`，94GB）
 - HF-Mirror 镜像站下载链路调通
 - `run.sh` 一键脚本（download/dry/bg/fg 四种模式）
 - 环境自检通过（2x L20 各 44GB，CUDA 13.2）
+- `server_hobbit.py` 代码就绪（环境自检 + HOBBIT 缝合 + 统计逻辑）
 
-**当前卡点：模型加载 OOM**
+**当前卡点：模型加载 OOM，6 次尝试均失败**
 
-Mixtral-8x7B FP16 = 94GB，2x L20 = 88GB 放不下。4-bit 量化理论 ~24GB，但加载时需创建 FP16 中间张量再量化，瞬时内存需求超过单卡。`BitsAndBytesConfig` 严格校验与 `device_map` 的 CPU dispatch 存在死循环。最新尝试：绕过 `BitsAndBytesConfig`，用 `load_in_4bit=True` 直接传参。
+Mixtral-8x7B FP16 = 94GB，2x L20 = 88GB（实际可用 ~44GB x2）。无论 4-bit 还是 8-bit 量化，加载过程的 GPU 内存管理均存在问题。
 
-**加载策略演进（5 次尝试）：**
+**加载策略演进（6 次尝试）：**
 
 | # | 方案 | 结果 |
 |---|------|------|
-| 1 | `device_map="auto"` + `BitsAndBytesConfig` | 校验拒绝 CPU dispatch |
-| 2 | `device_map={"":0}` + `BitsAndBytesConfig` | 单卡 OOM（峰值 44.35GB / 44.39GB） |
-| 3 | `device_map="auto"` + CPU offload | 加载成功，层 28-31 meta 状态，推理崩溃 |
-| 4 | `device_map="auto"` + `max_memory` 各 42GB | 校验拒绝 CPU dispatch |
-| 5 | `load_in_4bit=True` 直接传参，无 `BitsAndBytesConfig` | 待测试 |
+| 1 | `device_map="auto"` + `BitsAndBytesConfig(4bit)` | 校验拒绝 CPU dispatch |
+| 2 | `device_map={"":0}` + `BitsAndBytesConfig(4bit)` | 单卡 OOM（峰值 44.35/44.39GB） |
+| 3 | `device_map="auto"` + CPU offload + `llm_int8_enable_fp32_cpu_offload` | 加载成功，但层 28-31 meta 状态，推理崩溃 |
+| 4 | `device_map="auto"` + `max_memory` 各 42GB + `BitsAndBytesConfig(4bit)` | 校验拒绝 CPU dispatch |
+| 5 | `load_in_4bit=True` 直接传参 + `device_map="auto"` | `__init__` 不接受 `load_in_4bit` |
+| 6 | `BitsAndBytesConfig(load_in_8bit=True)` + `device_map="auto"` | 8-bit ~47GB 理论够，但仍 OOM |
+
+**卡点分析（推测）：**
+- bitsandbytes 量化加载不是逐层 stream 的——它批量加载 shard 到 GPU 做量化，中间 FP16 张量瞬间撑爆单卡
+- `device_map="auto"` 在多 GPU 环境下可能没有均匀分摊加载压力，某一瞬间一张卡负载过高
+- `gate_up_proj` 权重合并（w1, w3 -> gate_up）在 GPU 上做 concat，需要连续大块显存
+- 两张 L20 跨卡通信可能是隐性问题——P2P 带宽或显存碎片导致某张卡实际可用量更低
+
+**后续可尝试的方向（暂停实验，先整理思路）：**
+1. 先单卡加载一个小模型验证 HOBBIT 缝合逻辑正确性（如 Mistral-7B 非 MoE，或 Qwen2-MoE 小版本）
+2. 用 `accelerate` 做纯 CPU 离线量化（先加载到 CPU 做 4-bit，再 `to("cuda")`），避开 GPU 上的中间 FP16 状态
+3. 换用 GPTQ 或 AWQ 量化权重（预先量化好，加载时直接上 GPU，无中间态）
+4. 单卡加载：用 `device_map="auto"` 但限制只用 GPU 0 + CPU offload（而非双卡），让 accelerate 单线程分配
+5. 检查 `accelerate` 和 `bitsandbytes` 版本兼容性——服务端 PyTorch 2.12 + CUDA 13.2 组合较新，可能存在未修复的 bug
 
 ---
 
@@ -104,9 +119,10 @@ Mixtral-8x7B FP16 = 94GB，2x L20 = 88GB 放不下。4-bit 量化理论 ~24GB，
 | 3.5 功能验证 | batch=1, seq_len=32 跑通真实推理 | 输出 logits 正确，打印 HOBBIT 降级日志 |
 
 **验收门禁（阶段3）：**
-- [ ] 模型成功加载到 GPU 显存
-- [ ] 32 层 MoE 全部替换为 HOBBIT 版本
-- [ ] 小 batch 推理输出 token，三种路径（FP16命中 / INT4降级 / 跳过）均被触发
+- [x] 3.1 环境准备：服务器 CUDA 13.2、bitsandbytes 0.49.2、PyTorch 2.12 就绪
+- [x] 3.2 模型下载：已下载到本地 `~/models/mixtral-8x7b`（94GB）
+- [ ] 3.2 加载成功：6 次尝试均 OOM，暂停，需换策略
+- [ ] 3.4-3.5 缝合 HOBBIT + 功能验证：代码就绪，等加载问题解决后可直接跑
 
 ---
 
@@ -231,7 +247,7 @@ print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] DONE")
 
 ### 下一步操作（按优先级）
 
-1. **解决模型加载 OOM**：当前卡在 4-bit 量化 + device_map 的组合上，需要找到能稳定加载 94GB 模型到 2x44GB 显存的方案
+1. **解决模型加载 OOM**：6 次尝试均失败（4-bit/8-bit + 多种 device_map 组合），怀疑是 bitsandbytes 加载时的 GPU 中间态内存管理问题或双卡分布问题。建议先换小模型验证逻辑、或用预量化权重（GPTQ/AWQ）绕过
 2. **跑通功能验证**：模型加载成功后，验证 HOBBIT 决策三层路径（FP16命中 / INT4降级 / 跳过）
 3. **性能测试**：跑基准对比（llama.cpp 原版、MoE-Infinity）
 4. **精度测试**：跑 MMLU/GSM8K 子集
