@@ -38,7 +38,7 @@ case "${1:-fg}" in
     download)
         echo "[run.sh] Downloading $MODEL_ID to $LOCAL_MODEL ..."
         echo "[run.sh] This may take 1-2 hours for ~94GB."
-        huggingface-cli download --resume-download "$MODEL_ID" \
+        hf download "$MODEL_ID" \
             --local-dir "$LOCAL_MODEL" \
             --local-dir-use-symlinks False
         echo "[run.sh] Done. Now run: LOCAL_MODEL_PATH=$LOCAL_MODEL bash run.sh"

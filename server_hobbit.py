@@ -193,10 +193,9 @@ def main():
         )
     except Exception as e:
         print(f"[LOAD] Failed to load model: {e}")
-        print("[LOAD] If download failed, pre-download with huggingface-cli:")
+        print("[LOAD] If download failed, pre-download with hf command:")
         print(f"[LOAD]   export HF_ENDPOINT=https://hf-mirror.com")
-        print(f"[LOAD]   huggingface-cli download --resume-download {model_id} "
-              f"--local-dir ~/models/mixtral-8x7b")
+        print(f"[LOAD]   hf download {model_id} --local-dir ~/models/mixtral-8x7b")
         print(f"[LOAD] Then re-run with:")
         print(f"[LOAD]   LOCAL_MODEL_PATH=~/models/mixtral-8x7b bash run.sh")
         raise
