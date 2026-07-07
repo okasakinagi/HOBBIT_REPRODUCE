@@ -46,19 +46,23 @@ case "${1:-fg}" in
         echo "[run.sh] This may take 1-2 hours for ~94GB."
         mkdir -p "$LOCAL_MODEL"
 
+        python3 << PYEOF
+import os
+os.environ['HF_HUB_ENABLE_HF_XET'] = '0'
+os.environ['HF_ENDPOINT'] = '${HF_ENDPOINT:-https://hf-mirror.com}'
 if '${HF_TOKEN:-}':
     os.environ['HF_TOKEN'] = '${HF_TOKEN}'
 from huggingface_hub import snapshot_download
-snapshot_download('$MODEL_ID', local_dir='$LOCAL_MODEL',
-                  local_dir_use_symlinks=False, resume_download=True,
-                  token='${HF_TOKEN:-}' or Non
-os.environ['HF_HUB_ENABLE_HF_XET'] = '0'
-os.environ['HF_ENDPOINT'] = '${HF_ENDPOINT:-https://hf-mirror.com}'
-from huggingface_hub import snapshot_download
-snapshot_download('$MODEL_ID', local_dir='$LOCAL_MODEL',
-                  local_dir_use_symlinks=False, resume_download=True)
+token = '${HF_TOKEN:-}' or None
+snapshot_download(
+    '${MODEL_ID}',
+    local_dir='${LOCAL_MODEL}',
+    local_dir_use_symlinks=False,
+    resume_download=True,
+    token=token,
+)
 print('Download complete.')
-"
+PYEOF
         echo "[run.sh] Done. Now run: LOCAL_MODEL_PATH=$LOCAL_MODEL bash run.sh"
         ;;
     dry)
