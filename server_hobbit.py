@@ -37,7 +37,7 @@ from datetime import datetime
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import MixtralConfig, MixtralForCausalLM
+from transformers import MixtralConfig, MixtralForCausalLM, BitsAndBytesConfig
 
 
 # ============================================================
@@ -181,14 +181,20 @@ def main():
         device_map = "cpu"
         print("[LOAD] No GPU detected, using CPU (inference will be very slow)")
 
-    # 4-bit 量化加载（94GB -> ~24GB，适配 L20 44GB）
+    # 4-bit 量化加载：Mixtral-8x7B FP16 = 94GB > 2xL20(88GB)，必须压缩
+    # 用 bitsandbytes NF4 把模型压到 ~24GB，在量化模型之上运行 HOBBIT 决策逻辑
+    # 这不是替代 HOBBIT，是让它能加载的前提
     print("[LOAD] Using 4-bit quantization (bitsandbytes NF4) to fit GPU memory...")
+    print("[LOAD] Mixtral-8x7B FP16=94GB > 2xL20(88GB), need 4-bit (~24GB) to load")
     try:
-        model = MixtralForCausalLM.from_pretrained(
-            model_id,
+        bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.float16,
             bnb_4bit_quant_type="nf4",
+        )
+        model = MixtralForCausalLM.from_pretrained(
+            model_id,
+            quantization_config=bnb_config,
             device_map=device_map,
             local_files_only=bool(local_path),
         )
