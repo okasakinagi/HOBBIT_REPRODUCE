@@ -38,8 +38,18 @@ case "${1:-fg}" in
     download)
         echo "[run.sh] Downloading $MODEL_ID to $LOCAL_MODEL ..."
         echo "[run.sh] This may take 1-2 hours for ~94GB."
-        hf download "$MODEL_ID" \
-            --local-dir "$LOCAL_MODEL"
+        mkdir -p "$LOCAL_MODEL"
+
+        # 用 Python 直接下载（在 import 前设 env var，彻底禁用 Xet）
+        python3 -c "
+import os
+os.environ['HF_HUB_ENABLE_HF_XET'] = '0'
+os.environ['HF_ENDPOINT'] = '${HF_ENDPOINT:-https://hf-mirror.com}'
+from huggingface_hub import snapshot_download
+snapshot_download('$MODEL_ID', local_dir='$LOCAL_MODEL',
+                  local_dir_use_symlinks=False, resume_download=True)
+print('Download complete.')
+"
         echo "[run.sh] Done. Now run: LOCAL_MODEL_PATH=$LOCAL_MODEL bash run.sh"
         ;;
     dry)
