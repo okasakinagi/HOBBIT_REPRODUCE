@@ -183,19 +183,16 @@ def main():
         device_map = "cpu"
         print("[LOAD] No GPU detected, using CPU (inference will be very slow)")
 
-    # 4-bit 量化加载：Mixtral-8x7B FP16 = 94GB > 2xL20(88GB)，必须压缩
-    # 用 bitsandbytes NF4 把模型压到 ~24GB，在量化模型之上运行 HOBBIT 决策逻辑
-    # 这不是替代 HOBBIT，是让它能加载的前提
-    # 注意：不使用 BitsAndBytesConfig（其严格校验会拒绝任何 CPU dispatch，导致死循环）
-    #       改用旧式直接传参方式，让 accelerate 自行决定分配
-    print("[LOAD] Using 4-bit quantization (bitsandbytes NF4) to fit GPU memory...")
-    print("[LOAD] Mixtral-8x7B FP16=94GB > 2xL20(88GB), need 4-bit (~24GB) to load")
+    # 8-bit 量化加载：Mixtral-8x7B FP16 = 94GB > 2xL20(88GB)，必须压缩
+    # 用 bitsandbytes LLM.int8() 把模型压到 ~47GB（8-bit 无 4-bit 的 CPU dispatch 校验死循环）
+    # 注意：不追求 4-bit 的极致压缩，47GB 在 88GB 显存中绰绰有余
+    print("[LOAD] Using 8-bit quantization (bitsandbytes LLM.int8) to fit GPU memory...")
+    print("[LOAD] Mixtral-8x7B FP16=94GB > 2xL20(88GB), 8-bit (~47GB) fits in 88GB")
     try:
+        bnb_config = BitsAndBytesConfig(load_in_8bit=True)
         model = MixtralForCausalLM.from_pretrained(
             model_id,
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_quant_type="nf4",
+            quantization_config=bnb_config,
             device_map=device_map,
             local_files_only=bool(local_path),
         )
