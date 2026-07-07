@@ -175,8 +175,10 @@ def main():
     # 根据 GPU 数量决定 device_map
     n_gpus = torch.cuda.device_count()
     if n_gpus >= 1:
-        device_map = "auto"
-        print(f"[LOAD] Using device_map='auto' with {n_gpus} GPU(s)")
+        # 4-bit Mixtral ~24GB，单张 L20 44GB 完全够用
+        # 不用 "auto"：和 BitsAndBytesConfig 有兼容性问题，会把部分层误分到 CPU
+        device_map = {"": 0}
+        print(f"[LOAD] Using device_map='{{\"\": 0}}' ({n_gpus} GPU(s) available, using GPU 0)")
     else:
         device_map = "cpu"
         print("[LOAD] No GPU detected, using CPU (inference will be very slow)")
