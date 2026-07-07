@@ -192,10 +192,13 @@ def main():
             bnb_4bit_compute_dtype=torch.float16,
             bnb_4bit_quant_type="nf4",
         )
+        # 显式限制每张 GPU 最多用 40GB（留 4GB 给激活值和框架开销）
+        max_memory = {i: "40GB" for i in range(n_gpus)} if n_gpus > 0 else None
         model = MixtralForCausalLM.from_pretrained(
             model_id,
             quantization_config=bnb_config,
             device_map=device_map,
+            max_memory=max_memory,
             local_files_only=bool(local_path),
         )
     except Exception as e:
