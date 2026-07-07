@@ -32,8 +32,9 @@ g:\moe\
 ├── inspect_mixtral.py       ← Mixtral 结构探查脚本（已跑通）
 ├── mixtral_hobbit_empty.py  ← HOBBIT 缝合迷你模型（已跑通）
 │
-├── [阶段3：服务器部署 — 脚本就绪]
-└── server_hobbit.py         ← 服务器一键部署脚本（含环境自检+加载+缝合+验证）
+├── [阶段3：服务器部署 — 进行中]
+├── server_hobbit.py         ← 服务器主脚本（环境自检+加载+缝合+验证）
+├── run.sh                   ← 服务器一键运行（download/dry/bg/fg 四种模式）
 ```
 
 ---
@@ -63,6 +64,28 @@ g:\moe\
 **验证结果**（迷你模型，随机输入 1×32）：
 - 输入 `[1, 32]` -> 输出 logits `[1, 32, 32000]`
 - FP16 命中率 6.2%，INT4 使用率 50%，跳过率 0%（初始缓存仅 2 个 FP16 专家）
+
+### 阶段3：服务器部署（进行中，模型加载调试中）
+
+**已完成：**
+- 模型权重下载到服务器本地（`~/models/mixtral-8x7b`，94GB）
+- HF-Mirror 镜像站下载链路调通
+- `run.sh` 一键脚本（download/dry/bg/fg 四种模式）
+- 环境自检通过（2x L20 各 44GB，CUDA 13.2）
+
+**当前卡点：模型加载 OOM**
+
+Mixtral-8x7B FP16 = 94GB，2x L20 = 88GB 放不下。4-bit 量化理论 ~24GB，但加载时需创建 FP16 中间张量再量化，瞬时内存需求超过单卡。`BitsAndBytesConfig` 严格校验与 `device_map` 的 CPU dispatch 存在死循环。最新尝试：绕过 `BitsAndBytesConfig`，用 `load_in_4bit=True` 直接传参。
+
+**加载策略演进（5 次尝试）：**
+
+| # | 方案 | 结果 |
+|---|------|------|
+| 1 | `device_map="auto"` + `BitsAndBytesConfig` | 校验拒绝 CPU dispatch |
+| 2 | `device_map={"":0}` + `BitsAndBytesConfig` | 单卡 OOM（峰值 44.35GB / 44.39GB） |
+| 3 | `device_map="auto"` + CPU offload | 加载成功，层 28-31 meta 状态，推理崩溃 |
+| 4 | `device_map="auto"` + `max_memory` 各 42GB | 校验拒绝 CPU dispatch |
+| 5 | `load_in_4bit=True` 直接传参，无 `BitsAndBytesConfig` | 待测试 |
 
 ---
 
@@ -208,30 +231,10 @@ print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] DONE")
 
 ### 下一步操作（按优先级）
 
-1. **推送到 GitHub + 服务器拉取**
-   ```bash
-   # 本地：提交并推送
-   git add -A && git commit -m "Phase 1-2 complete, add server deployment script"
-   git push origin main
-
-   # 服务器：克隆仓库
-   git clone https://github.com/okasakinagi/HOBBIT_REPRODUCE.git
-   cd HOBBIT_REPRODUCE
-   pip install torch transformers accelerate bitsandbytes sentencepiece
-   mkdir -p logs
-   ```
-
-2. **运行阶段3 验证**：服务器上执行
-   ```bash
-   nohup python server_hobbit.py > logs/server_$(date +%Y%m%d_%H%M%S).log 2>&1 &
-   # 查看进度
-   tail -f logs/server_*.log
-   ```
-
-3. **性能测试**：跑基准对比（llama.cpp 原版、MoE-Infinity），日志重定向
-
-4. **精度测试**：跑 MMLU/GSM8K 子集，日志重定向
-
+1. **解决模型加载 OOM**：当前卡在 4-bit 量化 + device_map 的组合上，需要找到能稳定加载 94GB 模型到 2x44GB 显存的方案
+2. **跑通功能验证**：模型加载成功后，验证 HOBBIT 决策三层路径（FP16命中 / INT4降级 / 跳过）
+3. **性能测试**：跑基准对比（llama.cpp 原版、MoE-Infinity）
+4. **精度测试**：跑 MMLU/GSM8K 子集
 5. **消融实验**：分别关闭三大创新，量化各自贡献
 
 ---
@@ -274,6 +277,12 @@ print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] DONE")
 
 | 问题 | 解决方案 |
 |------|----------|
-| MoE 层属性名找不到 | 新版 transformers 中属性名是 `mlp`，类型 `MixtralSparseMoeBlock`，不能按名字搜索 |
-| forward 返回值类型不匹配 | 类型标注是 tuple 但实际只返回单个 tensor，router_logits 通过 `OutputRecorder` 单独收集 |
-| `init_empty_weights` 后 `.to("cpu")` 报错 | meta tensor 不能 `.to()`，迷你模型直接正常创建即可（仅 21M 参数） |
+| MoE 层属性名找不到 | 新版 transformers 中属性名是 `mlp`，类型 `MixtralSparseMoeBlock` |
+| forward 返回值类型不匹配 | 类型标注是 tuple 但实际只返回单个 tensor |
+| `init_empty_weights` 后 `.to("cpu")` 报错 | meta tensor 不能 `.to()`，迷你模型正常创建即可 |
+| `huggingface-cli` 已废弃 | 新版用 `hf download` 替代 |
+| Xet CAS 401 错误 | `HF_HUB_ENABLE_HF_XET=0` 必须设在所有 import 之前 |
+| `load_in_4bit` 不能直接传 `from_pretrained` | 新版须用 `BitsAndBytesConfig`，但有校验死循环 |
+| `BitsAndBytesConfig` + `device_map` 死循环 | 校验拒绝 CPU dispatch；绕过用 `load_in_4bit=True` 旧式参数 |
+| CPU offload -> meta tensor 崩溃 | bitsandbytes 4-bit 权重无法处理 meta tensor |
+| 单卡加载 OOM | 4-bit 加载先创建 FP16 中间张量再量化，瞬时内存 > 44GB |
