@@ -9,8 +9,9 @@
 #   bash run.sh download     # 预下载模型到本地（推荐先执行）
 #
 # 配置：
-#   USE_HF_MIRROR=0 bash run.sh       # 直连 huggingface.co
+#   USE_HF_MIRROR=0 bash run.sh              # 直连 huggingface.co
 #   LOCAL_MODEL_PATH=~/models/mixtral bash run.sh   # 从本地加载
+#   HF_TOKEN=hf_xxx bash run.sh download     # 带 token 下载（需登录的模型）
 # ================================================================
 
 set -e
@@ -31,6 +32,11 @@ else
     echo "[run.sh] Using huggingface.co directly"
 fi
 
+# --- HF Token（可选，需登录的模型才需要）---
+if [ -n "${HF_TOKEN:-}" ]; then
+    echo "[run.sh] HF_TOKEN is set"
+fi
+
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG_FILE="${LOG_DIR}/server_${TIMESTAMP}.log"
 
@@ -40,9 +46,12 @@ case "${1:-fg}" in
         echo "[run.sh] This may take 1-2 hours for ~94GB."
         mkdir -p "$LOCAL_MODEL"
 
-        # 用 Python 直接下载（在 import 前设 env var，彻底禁用 Xet）
-        python3 -c "
-import os
+if '${HF_TOKEN:-}':
+    os.environ['HF_TOKEN'] = '${HF_TOKEN}'
+from huggingface_hub import snapshot_download
+snapshot_download('$MODEL_ID', local_dir='$LOCAL_MODEL',
+                  local_dir_use_symlinks=False, resume_download=True,
+                  token='${HF_TOKEN:-}' or Non
 os.environ['HF_HUB_ENABLE_HF_XET'] = '0'
 os.environ['HF_ENDPOINT'] = '${HF_ENDPOINT:-https://hf-mirror.com}'
 from huggingface_hub import snapshot_download
