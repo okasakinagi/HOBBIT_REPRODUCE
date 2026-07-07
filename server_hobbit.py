@@ -166,7 +166,7 @@ def main():
     print(f"\n[{time.strftime('%H:%M:%S')}] Loading Mixtral-8x7B model...")
     model_id = "mistralai/Mixtral-8x7B-v0.1"
 
-    # 支持从本地目录加载（先用 huggingface-cli download 下载到本地）
+    # 支持从本地目录加载
     local_path = os.environ.get("LOCAL_MODEL_PATH", "").strip()
     if local_path and os.path.isdir(local_path):
         print(f"[LOAD] Using local model: {local_path}")
@@ -174,20 +174,21 @@ def main():
 
     # 根据 GPU 数量决定 device_map
     n_gpus = torch.cuda.device_count()
-    if n_gpus >= 2:
+    if n_gpus >= 1:
         device_map = "auto"
-        print(f"[LOAD] Using device_map='auto' with {n_gpus} GPUs")
-    elif n_gpus == 1:
-        device_map = "auto"
-        print(f"[LOAD] Using device_map='auto' with 1 GPU")
+        print(f"[LOAD] Using device_map='auto' with {n_gpus} GPU(s)")
     else:
         device_map = "cpu"
         print("[LOAD] No GPU detected, using CPU (inference will be very slow)")
 
+    # 4-bit 量化加载（94GB -> ~24GB，适配 L20 44GB）
+    print("[LOAD] Using 4-bit quantization (bitsandbytes NF4) to fit GPU memory...")
     try:
         model = MixtralForCausalLM.from_pretrained(
             model_id,
-            torch_dtype=torch.float16,
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_quant_type="nf4",
             device_map=device_map,
             local_files_only=bool(local_path),
         )
