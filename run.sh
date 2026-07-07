@@ -32,6 +32,9 @@ else
     echo "[run.sh] Using huggingface.co directly"
 fi
 
+# 减少 CUDA 内存碎片（加载大模型时推荐）
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
 # --- HF Token（可选，需登录的模型才需要）---
 if [ -n "${HF_TOKEN:-}" ]; then
     echo "[run.sh] HF_TOKEN is set"

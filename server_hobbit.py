@@ -175,10 +175,10 @@ def main():
     # 根据 GPU 数量决定 device_map
     n_gpus = torch.cuda.device_count()
     if n_gpus >= 1:
-        # 4-bit Mixtral ~24GB，单张 L20 44GB 完全够用
-        # 不用 "auto"：和 BitsAndBytesConfig 有兼容性问题，会把部分层误分到 CPU
-        device_map = {"": 0}
-        print(f"[LOAD] Using device_map='{{\"\": 0}}' ({n_gpus} GPU(s) available, using GPU 0)")
+        # 4-bit 加载时需创建中间 FP16 张量再量化，单卡 44GB 不够
+        # 用 "auto" 分摊到多卡 + CPU，限制每卡用量防 OOM
+        device_map = "auto"
+        print(f"[LOAD] Using device_map='auto' with {n_gpus} GPU(s)")
     else:
         device_map = "cpu"
         print("[LOAD] No GPU detected, using CPU (inference will be very slow)")
@@ -186,6 +186,7 @@ def main():
     # 4-bit 量化加载：Mixtral-8x7B FP16 = 94GB > 2xL20(88GB)，必须压缩
     # 用 bitsandbytes NF4 把模型压到 ~24GB，在量化模型之上运行 HOBBIT 决策逻辑
     # 这不是替代 HOBBIT，是让它能加载的前提
+    # 注意：加载时需创建中间 FP16 张量，限制每卡 38GB 留余量防 OOM
     print("[LOAD] Using 4-bit quantization (bitsandbytes NF4) to fit GPU memory...")
     print("[LOAD] Mixtral-8x7B FP16=94GB > 2xL20(88GB), need 4-bit (~24GB) to load")
     try:
@@ -193,9 +194,12 @@ def main():
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.float16,
             bnb_4bit_quant_type="nf4",
+            llm_int8_enable_fp32_cpu_offload=True,  # 允许中间 FP32 层临时放 CPU
         )
-        # 显式限制每张 GPU 最多用 40GB（留 4GB 给激活值和框架开销）
-        max_memory = {i: "40GB" for i in range(n_gpus)} if n_gpus > 0 else None
+        # 每卡 38GB（留 6GB 给激活值），其余放 CPU
+        max_memory = {i: "38GB" for i in range(n_gpus)} if n_gpus > 0 else None
+        if max_memory:
+            max_memory["cpu"] = "200GB"
         model = MixtralForCausalLM.from_pretrained(
             model_id,
             quantization_config=bnb_config,
