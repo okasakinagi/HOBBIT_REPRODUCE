@@ -3,12 +3,14 @@
 # run.sh — HOBBIT 服务器一键运行脚本
 #
 # 用法：
-#   bash run.sh           # 前台运行（输出到终端 + 日志文件）
-#   bash run.sh bg        # 后台运行（nohup）
-#   bash run.sh dry       # 本地 dry-run（跳过模型加载，验证环境）
+#   bash run.sh              # 前台运行
+#   bash run.sh bg           # 后台运行（nohup）
+#   bash run.sh dry          # dry-run（跳过模型加载）
+#   bash run.sh download     # 预下载模型到本地（推荐先执行）
 #
-# 配置 HF-Mirror（国内服务器必备，默认启用）：
-#   USE_HF_MIRROR=0 bash run.sh    # 直连 huggingface.co
+# 配置：
+#   USE_HF_MIRROR=0 bash run.sh       # 直连 huggingface.co
+#   LOCAL_MODEL_PATH=~/models/mixtral bash run.sh   # 从本地加载
 # ================================================================
 
 set -e
@@ -16,6 +18,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${SCRIPT_DIR}/../logs"
 mkdir -p "${LOG_DIR}"
+
+MODEL_ID="mistralai/Mixtral-8x7B-v0.1"
+LOCAL_MODEL="${LOCAL_MODEL_PATH:-$HOME/models/mixtral-8x7b}"
 
 # --- HF-Mirror 镜像站（默认启用）---
 if [ "${USE_HF_MIRROR:-1}" = "1" ]; then
@@ -30,6 +35,14 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG_FILE="${LOG_DIR}/server_${TIMESTAMP}.log"
 
 case "${1:-fg}" in
+    download)
+        echo "[run.sh] Downloading $MODEL_ID to $LOCAL_MODEL ..."
+        echo "[run.sh] This may take 1-2 hours for ~94GB."
+        huggingface-cli download --resume-download "$MODEL_ID" \
+            --local-dir "$LOCAL_MODEL" \
+            --local-dir-use-symlinks False
+        echo "[run.sh] Done. Now run: LOCAL_MODEL_PATH=$LOCAL_MODEL bash run.sh"
+        ;;
     dry)
         echo "[run.sh] Dry-run mode — skip model loading"
         SKIP_MODEL_LOAD=1 python server_hobbit.py

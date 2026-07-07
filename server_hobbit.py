@@ -27,8 +27,9 @@ server_hobbit.py — 服务器部署脚本
 import sys
 import os
 
-# --- 必须在任何 huggingface 相关 import 之前设置，否则 Xet 模块已缓存配置 ---
-os.environ.setdefault("HF_HUB_ENABLE_HF_XET", "0")
+# --- 必须在任何 huggingface 相关 import 之前设置 ---
+# 强制关闭 Xet（HF-Mirror 不支持，否则 401 Unauthorized）
+os.environ["HF_HUB_ENABLE_HF_XET"] = "0"
 
 import time
 from datetime import datetime
@@ -165,10 +166,16 @@ def main():
     print(f"\n[{time.strftime('%H:%M:%S')}] Loading Mixtral-8x7B model...")
     model_id = "mistralai/Mixtral-8x7B-v0.1"
 
+    # 支持从本地目录加载（先用 huggingface-cli download 下载到本地）
+    local_path = os.environ.get("LOCAL_MODEL_PATH", "").strip()
+    if local_path and os.path.isdir(local_path):
+        print(f"[LOAD] Using local model: {local_path}")
+        model_id = local_path
+
     # 根据 GPU 数量决定 device_map
     n_gpus = torch.cuda.device_count()
     if n_gpus >= 2:
-        device_map = "auto"  # 多 GPU 自动分配
+        device_map = "auto"
         print(f"[LOAD] Using device_map='auto' with {n_gpus} GPUs")
     elif n_gpus == 1:
         device_map = "auto"
@@ -177,11 +184,22 @@ def main():
         device_map = "cpu"
         print("[LOAD] No GPU detected, using CPU (inference will be very slow)")
 
-    model = MixtralForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch.float16,
-        device_map=device_map,
-    )
+    try:
+        model = MixtralForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=torch.float16,
+            device_map=device_map,
+            local_files_only=bool(local_path),
+        )
+    except Exception as e:
+        print(f"[LOAD] Failed to load model: {e}")
+        print("[LOAD] If download failed, pre-download with huggingface-cli:")
+        print(f"[LOAD]   export HF_ENDPOINT=https://hf-mirror.com")
+        print(f"[LOAD]   huggingface-cli download --resume-download {model_id} "
+              f"--local-dir ~/models/mixtral-8x7b")
+        print(f"[LOAD] Then re-run with:")
+        print(f"[LOAD]   LOCAL_MODEL_PATH=~/models/mixtral-8x7b bash run.sh")
+        raise
     print(f"[LOAD] Model loaded successfully")
 
     # 打印每层设备分布
