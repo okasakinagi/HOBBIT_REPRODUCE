@@ -18,6 +18,10 @@ server_hobbit.py — 服务器部署脚本
 
 前提：
     pip install torch transformers accelerate bitsandbytes sentencepiece
+
+    国内服务器如遇网络问题，设置环境变量即可：
+    export HF_ENDPOINT="https://hf-mirror.com"
+    export HF_HUB_ENABLE_HF_XET=0
 """
 
 import sys
@@ -35,6 +39,9 @@ from transformers import MixtralConfig, MixtralForCausalLM
 # 0. 环境自检
 # ============================================================
 def env_check():
+    # 禁用 Xet 存储（HF-Mirror 不支持，否则报 401 Unauthorized）
+    os.environ.setdefault("HF_HUB_ENABLE_HF_XET", "0")
+
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] START: {sys.argv[0]}")
     print(f"[ENV] Python={sys.version.split()[0]}")
     print(f"[ENV] PyTorch={torch.__version__}")

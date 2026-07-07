@@ -20,7 +20,8 @@ mkdir -p "${LOG_DIR}"
 # --- HF-Mirror 镜像站（默认启用）---
 if [ "${USE_HF_MIRROR:-1}" = "1" ]; then
     export HF_ENDPOINT="https://hf-mirror.com"
-    echo "[run.sh] HF_ENDPOINT=$HF_ENDPOINT"
+    export HF_HUB_ENABLE_HF_XET=0
+    echo "[run.sh] HF_ENDPOINT=$HF_ENDPOINT (Xet disabled)"
 else
     echo "[run.sh] Using huggingface.co directly"
 fi
