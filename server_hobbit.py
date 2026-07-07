@@ -186,21 +186,17 @@ def main():
     # 4-bit 量化加载：Mixtral-8x7B FP16 = 94GB > 2xL20(88GB)，必须压缩
     # 用 bitsandbytes NF4 把模型压到 ~24GB，在量化模型之上运行 HOBBIT 决策逻辑
     # 这不是替代 HOBBIT，是让它能加载的前提
+    # 注意：不使用 BitsAndBytesConfig（其严格校验会拒绝任何 CPU dispatch，导致死循环）
+    #       改用旧式直接传参方式，让 accelerate 自行决定分配
     print("[LOAD] Using 4-bit quantization (bitsandbytes NF4) to fit GPU memory...")
     print("[LOAD] Mixtral-8x7B FP16=94GB > 2xL20(88GB), need 4-bit (~24GB) to load")
     try:
-        bnb_config = BitsAndBytesConfig(
+        model = MixtralForCausalLM.from_pretrained(
+            model_id,
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.float16,
             bnb_4bit_quant_type="nf4",
-        )
-        # 每卡 42GB（留 2GB 余量），加载时 FP16 中间张量会临时超一点但能回收
-        max_memory = {i: "42GB" for i in range(n_gpus)} if n_gpus > 0 else None
-        model = MixtralForCausalLM.from_pretrained(
-            model_id,
-            quantization_config=bnb_config,
             device_map=device_map,
-            max_memory=max_memory,
             local_files_only=bool(local_path),
         )
     except Exception as e:
