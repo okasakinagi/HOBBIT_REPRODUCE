@@ -4,11 +4,17 @@ server_hobbit.py — 服务器部署脚本
 阶段3：真实 Mixtral-8x7B + HOBBIT 混合精度推理
 
 用法（服务器上）：
-    # 基本运行（输出到终端+文件）
-    python server_hobbit.py 2>&1 | tee logs/server_$(date +%Y%m%d_%H%M%S).log
+    # 基本运行（输出到终端+文件，logs 在项目上级目录避免 git pull 冲突）
+    python server_hobbit.py 2>&1 | tee ../logs/server_$(date +%Y%m%d_%H%M%S).log
 
     # 纯后台无人值守
-    nohup python server_hobbit.py > logs/server_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+    nohup python server_hobbit.py > ../logs/server_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+
+    # 一键运行（推荐）
+    bash run.sh
+
+本地 dry-run（跳过模型加载，仅验证代码逻辑）：
+    SKIP_MODEL_LOAD=1 python server_hobbit.py
 
 前提：
     pip install torch transformers accelerate bitsandbytes sentencepiece
@@ -33,18 +39,29 @@ def env_check():
     print(f"[ENV] Python={sys.version.split()[0]}")
     print(f"[ENV] PyTorch={torch.__version__}")
     print(f"[ENV] CUDA available={torch.cuda.is_available()}")
+
+    # HF-Mirror 镜像站（解决 huggingface.co 不可达问题）
+    hf_endpoint = os.environ.get("HF_ENDPOINT", "")
+    if hf_endpoint:
+        print(f"[ENV] HF_ENDPOINT={hf_endpoint} (using mirror)")
+    else:
+        print("[ENV] HF_ENDPOINT not set (using huggingface.co directly)")
+
     if torch.cuda.is_available():
         for i in range(torch.cuda.device_count()):
             props = torch.cuda.get_device_properties(i)
-            print(f"[ENV] GPU[{i}]: {props.name}, "
-                  f"VRAM={props.total_mem//(1024**3)}GB, "
-                  f"Compute={props.major}.{props.minor}")
+            print(
+                f"[ENV] GPU[{i}]: {props.name}, "
+                f"VRAM={props.total_memory//(1024**3)}GB, "
+                f"Compute={props.major}.{props.minor}"
+            )
     else:
         print("[WARN] CUDA not available, running on CPU (will be very slow)")
 
     # 检查 bitsandbytes
     try:
         import bitsandbytes as bnb
+
         print(f"[ENV] bitsandbytes={bnb.__version__}")
     except ImportError:
         print("[WARN] bitsandbytes not installed, INT4 quantization will be skipped")
@@ -55,11 +72,12 @@ def env_check():
 # 1. HOBBIT 参数配置
 # ============================================================
 HOBBIT_CONFIG = {
-    "T1": 0.6,   # 论文 Mixtral 策略值（仿真阶段用 0.3，服务器用论文 0.6）
-    "T2": 0.9,   # 高于此值直接跳过
+    "T1": 0.6,  # 论文 Mixtral 策略值（仿真阶段用 0.3，服务器用论文 0.6）
+    "T2": 0.9,  # 高于此值直接跳过
     "fp16_cache_size": 2,
     "int4_cache_size": 6,
 }
+
 
 # ============================================================
 # 2. HOBBIT 版 MoE 前向传播（猴子补丁方式替换原生的 forward）
@@ -67,10 +85,11 @@ HOBBIT_CONFIG = {
 def make_hobbit_forward(original_forward, layer_idx, stats):
     """
     返回一个包装过的 forward 函数，在原生 MoE 计算前后插入 HOBBIT 决策逻辑。
-    
+
     注意：第一版服务器脚本主要验证决策逻辑和统计，INT4 实际计算在后续版本实现。
     当前版本在决策点打印日志并统计，但仍用 FP16 专家完成计算（确保输出正确）。
     """
+
     def hobbit_forward(self, hidden_states):
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         num_tokens = batch_size * sequence_length
@@ -125,6 +144,14 @@ def make_hobbit_forward(original_forward, layer_idx, stats):
 # ============================================================
 def main():
     env_check()
+
+    # --- Dry-run 模式：跳过模型加载，仅验证代码路径 ---
+    if os.environ.get("SKIP_MODEL_LOAD", "").strip() in ("1", "true", "True"):
+        print(f"\n[{time.strftime('%H:%M:%S')}] SKIP_MODEL_LOAD=1 — dry-run mode")
+        print("[DRY-RUN] Skipping model download and inference.")
+        print("[DRY-RUN] Code path verified: env_check + imports all OK.")
+        print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] DONE (dry-run)")
+        return
 
     # --- 3a. 加载真实 Mixtral-8x7B ---
     print(f"\n[{time.strftime('%H:%M:%S')}] Loading Mixtral-8x7B model...")
@@ -196,6 +223,7 @@ def main():
     tokenizer = None
     try:
         from transformers import AutoTokenizer
+
         tokenizer = AutoTokenizer.from_pretrained(model_id)
         test_input = tokenizer("Hello, how are you?", return_tensors="pt")
         input_ids = test_input["input_ids"]
@@ -228,43 +256,59 @@ def main():
         for i in range(5):
             tok_id = top5.indices[i].item()
             tok_str = tokenizer.decode([tok_id])
-            print(f"[INFER]   {i+1}. '{tok_str}' (id={tok_id}, prob={top5.values[i].item():.4f})")
+            print(
+                f"[INFER]   {i+1}. '{tok_str}' (id={tok_id}, prob={top5.values[i].item():.4f})"
+            )
 
     # --- 3d. HOBBIT 统计汇总 ---
     print(f"\n[{time.strftime('%H:%M:%S')}] HOBBIT Decision Statistics:")
-    print(f"{'Layer':>6} {'FP16-Hit':>10} {'FP16-Miss':>10} {'INT4-Use':>10} {'Skip':>10} {'Hit%':>8}")
+    print(
+        f"{'Layer':>6} {'FP16-Hit':>10} {'FP16-Miss':>10} {'INT4-Use':>10} {'Skip':>10} {'Hit%':>8}"
+    )
     print("-" * 60)
 
     total_all = {"hit_fp16": 0, "miss_fp16": 0, "use_int4": 0, "skip": 0}
     for s in per_layer_stats:
         t = s["hit_fp16"] + s["miss_fp16"] + s["use_int4"] + s["skip"]
         hit_pct = s["hit_fp16"] / t * 100 if t > 0 else 0
-        print(f"{s['layer']:>6} {s['hit_fp16']:>10} {s['miss_fp16']:>10} "
-              f"{s['use_int4']:>10} {s['skip']:>10} {hit_pct:>7.1f}%")
+        print(
+            f"{s['layer']:>6} {s['hit_fp16']:>10} {s['miss_fp16']:>10} "
+            f"{s['use_int4']:>10} {s['skip']:>10} {hit_pct:>7.1f}%"
+        )
         for k in total_all:
             total_all[k] += s[k]
 
     total_t = sum(total_all.values())
     if total_t > 0:
         print("-" * 60)
-        print(f"{'TOTAL':>6} {total_all['hit_fp16']:>10} {total_all['miss_fp16']:>10} "
-              f"{total_all['use_int4']:>10} {total_all['skip']:>10} "
-              f"{total_all['hit_fp16']/total_t*100:>7.1f}%")
+        print(
+            f"{'TOTAL':>6} {total_all['hit_fp16']:>10} {total_all['miss_fp16']:>10} "
+            f"{total_all['use_int4']:>10} {total_all['skip']:>10} "
+            f"{total_all['hit_fp16']/total_t*100:>7.1f}%"
+        )
 
         print(f"\n[STATS] Summary:")
         print(f"[STATS]   Total expert calls: {total_t}")
         print(f"[STATS]   FP16 hit rate:      {total_all['hit_fp16']/total_t*100:.1f}%")
-        print(f"[STATS]   FP16 miss (->INT4):  {total_all['miss_fp16']/total_t*100:.1f}%")
-        print(f"[STATS]   INT4 planned:        {total_all['use_int4']/total_t*100:.1f}%")
+        print(
+            f"[STATS]   FP16 miss (->INT4):  {total_all['miss_fp16']/total_t*100:.1f}%"
+        )
+        print(
+            f"[STATS]   INT4 planned:        {total_all['use_int4']/total_t*100:.1f}%"
+        )
         print(f"[STATS]   Skip rate:           {total_all['skip']/total_t*100:.1f}%")
-        combined_int4 = total_all['miss_fp16'] + total_all['use_int4']
-        print(f"[STATS]   Total would-use-INT4: {combined_int4/total_t*100:.1f}% "
-              f"(FP16 miss fallback + planned INT4)")
+        combined_int4 = total_all["miss_fp16"] + total_all["use_int4"]
+        print(
+            f"[STATS]   Total would-use-INT4: {combined_int4/total_t*100:.1f}% "
+            f"(FP16 miss fallback + planned INT4)"
+        )
 
     print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] DONE")
     print("[NOTE] This is Phase 3 functional verification only.")
     print("[NOTE] INT4 computation not yet integrated — all experts still use FP16.")
-    print("[NOTE] Next: create INT4-quantized expert copies with bitsandbytes for real speedup.")
+    print(
+        "[NOTE] Next: create INT4-quantized expert copies with bitsandbytes for real speedup."
+    )
 
 
 if __name__ == "__main__":
