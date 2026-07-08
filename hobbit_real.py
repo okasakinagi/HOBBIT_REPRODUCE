@@ -70,8 +70,9 @@ class HobbitRealLayer:
                 tw = w_cpu[t].sum(); cum = 0.0
                 for i in range(len(w_cpu[t])):
                     eid = int(idx_cpu[t][i])
+                    if i > 0:
+                        cum += w_cpu[t][i - 1]
                     score = 0.0 if i == 0 else cum / tw
-                    cum += w_cpu[t][i-1] if i > 0 else 0
                     
                     if score <= T1:
                         stats["hit" if eid in cache else "miss"] += 1
