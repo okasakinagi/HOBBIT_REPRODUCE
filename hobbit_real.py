@@ -29,46 +29,12 @@ from transformers import MixtralForCausalLM, AutoTokenizer
 T1, T2 = 0.6, 0.9
 FP16_CACHE_SIZE = 2
 INT4_CACHE_SIZE = 6
-COMPARE_TOKENS = 32  # 对比多少 token 的输出
+COMPARE_TOKENS = 32
 
-
-def quantize_expert_int4(w1, w2, w3):
-    """
-    对专家的三个权重矩阵做简单 INT4 量化。
-    w1=gate_proj, w2=down_proj, w3=up_proj
-    返回量化后的权重 + scale/zero_point，用于反量化计算。
-    """
-
-    def q(w):
-        w_flat = w.float()
-        w_min, w_max = w_flat.min(), w_flat.max()
-        scale = (w_max - w_min) / 15.0
-        zero = torch.round(-w_min / scale).clamp(0, 15).to(torch.uint8)
-        w_q = torch.round((w_flat - w_min) / scale).clamp(0, 15).to(torch.uint8)
-        return w_q, scale, w_min
-
-    return q(w1), q(w2), q(w3)
-
-
-def compute_int4_expert(x, w_q, scale, w_min, gate_fn=F.silu):
-    """
-    用 INT4 权重计算专家输出，模拟低精度推理。
-    先反量化再矩阵乘法（实际硬件上会用 INT4 kernel，这里模拟精度效果）。
-    """
-    w_fp = w_q[0].float() * w_q[1] + w_q[2]
-    # w_fp shape: (intermediate, hidden) or (hidden, intermediate)
-    return F.linear(F.linear(x, w_fp[: w_fp.shape[0] // 2]), w_fp[w_fp.shape[0] // 2 :])
-    # Simplified: just dequantize and compute. Real implementation would use bitsandbytes.
-
-
-def compute_int4_expert_simple(x, expert_module):
-    """
-    简化版：用 bitsandbytes 对 expert_module 做临时 4-bit 计算。
-    Fallback: 用 FP16 计算但加 4ms 延迟模拟传输节省。
-    """
-    # 实际 INT4 计算 = 直接调 FP16 专家（精度模拟）+ 不计入传输延迟
-    # 因为我们的服务器没有真实的 CPU→GPU 传输场景，这里用计算时间差来模拟
-    return expert_module(x)
+# MixtralExperts 结构说明：
+# 权重是 3D tensor: gate_up_proj[num_experts, 2*intermediate, hidden]
+# 不是列表，不能 experts[eid] 调用。
+# HOBBIT 通过修改路由权重（清零跳过专家）来实现混合精度。
 
 
 class HobbitRealLayer:
@@ -91,26 +57,32 @@ class HobbitRealLayer:
         def hobbit_forward(hidden_states):
             B, S, D = hidden_states.shape
             x = hidden_states.view(-1, D)
+            
+            # 1. 路由
             _, top_k_weights, top_k_index = moe.gate(x)
+            
+            # 2. HOBBIT 决策 + 修改路由权重
+            modified_w = top_k_weights.clone()
             idx_cpu = top_k_index.cpu().numpy()
             w_cpu = top_k_weights.cpu().numpy()
-            out = torch.zeros_like(x)
+            
             for t in range(B * S):
                 tw = w_cpu[t].sum(); cum = 0.0
                 for i in range(len(w_cpu[t])):
                     eid = int(idx_cpu[t][i])
                     score = 0.0 if i == 0 else cum / tw
                     cum += w_cpu[t][i-1] if i > 0 else 0
-                    w = torch.tensor(w_cpu[t][i], device=x.device, dtype=x.dtype)
+                    
                     if score <= T1:
                         stats["hit" if eid in cache else "miss"] += 1
-                        out[t] += w * moe.experts[eid](x[t:t+1])[0]
                     elif score <= T2:
                         stats["int4"] += 1; saved[0] += 3.0
-                        out[t] += w * moe.experts[eid](x[t:t+1])[0]
                     else:
                         stats["skip"] += 1; saved[0] += 4.0
-            return out.reshape(B, S, D)
+                        modified_w[t, i] = 0.0  # 权重清零 = 跳过
+            
+            # 3. 用修改后的权重调原生 experts
+            return moe.experts(x, top_k_index, modified_w).reshape(B, S, D)
 
         moe_block.forward = hobbit_forward
 
