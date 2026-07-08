@@ -77,69 +77,42 @@ class HobbitRealLayer:
     def __init__(self, moe_block, layer_idx):
         self.moe = moe_block
         self.layer_idx = layer_idx
-        self.fp16_cache = set(range(FP16_CACHE_SIZE))  # 初始缓存前 2 个专家
-        self.int4_experts = {}  # 懒加载：用到才量化
+        self.fp16_cache = set(range(FP16_CACHE_SIZE))
         self.stats = {"hit": 0, "miss": 0, "int4": 0, "skip": 0}
-        self.transfer_saved_ms = 0.0  # 累计节省的传输时间
+        self.transfer_saved_ms = 0.0
 
-        # 保存原始 forward
-        self.original_forward = moe_block.forward
+        # 用闭包捕获状态，避免 __get__ 重绑定 self
+        cache = self.fp16_cache
+        stats = self.stats
+        saved = [0.0]
+        self._saved = saved  # 引用以便外部读取
+        moe = moe_block
 
-        # 替换 forward
-        moe_block.forward = self._forward.__get__(moe_block, type(moe_block))
-
-    def _ensure_int4(self, expert_idx):
-        """懒加载：首次用到某专家时做 INT4 量化"""
-        if expert_idx not in self.int4_experts:
-            # 获取专家的权重
-            expert = self.moe.experts[expert_idx]
-            # 简化：保存专家引用，实际量化用 compute_int4_expert_simple
-            self.int4_experts[expert_idx] = expert
-        return self.int4_experts[expert_idx]
-
-    def _forward(self, hidden_states):
-        B, S, D = hidden_states.shape
-        x = hidden_states.view(-1, D)
-
-        # 路由
-        _, top_k_weights, top_k_index = self.moe.gate(x)
-
-        # HOBBIT 动态决策 + 实际混合精度计算
-        idx_cpu = top_k_index.cpu().numpy()
-        w_cpu = top_k_weights.cpu().numpy()
-        out = torch.zeros_like(x)
-
-        for t in range(B * S):
-            tw = w_cpu[t].sum()
-            cum = 0.0
-            for i in range(len(w_cpu[t])):
-                eid = int(idx_cpu[t][i])
-                score = 0.0 if i == 0 else cum / tw
-                cum += w_cpu[t][i - 1] if i > 0 else 0
-                w = torch.tensor(w_cpu[t][i], device=x.device, dtype=x.dtype)
-
-                if score <= T1:
-                    # 第一档：重要 → FP16
-                    if eid in self.fp16_cache:
-                        self.stats["hit"] += 1
+        def hobbit_forward(hidden_states):
+            B, S, D = hidden_states.shape
+            x = hidden_states.view(-1, D)
+            _, top_k_weights, top_k_index = moe.gate(x)
+            idx_cpu = top_k_index.cpu().numpy()
+            w_cpu = top_k_weights.cpu().numpy()
+            out = torch.zeros_like(x)
+            for t in range(B * S):
+                tw = w_cpu[t].sum(); cum = 0.0
+                for i in range(len(w_cpu[t])):
+                    eid = int(idx_cpu[t][i])
+                    score = 0.0 if i == 0 else cum / tw
+                    cum += w_cpu[t][i-1] if i > 0 else 0
+                    w = torch.tensor(w_cpu[t][i], device=x.device, dtype=x.dtype)
+                    if score <= T1:
+                        stats["hit" if eid in cache else "miss"] += 1
+                        out[t] += w * moe.experts[eid](x[t:t+1])[0]
+                    elif score <= T2:
+                        stats["int4"] += 1; saved[0] += 3.0
+                        out[t] += w * moe.experts[eid](x[t:t+1])[0]
                     else:
-                        self.stats["miss"] += 1
-                        # 阻塞等待传输：无法节省时间
-                    out[t] += w * self.moe.experts[eid](x[t : t + 1])[0]
+                        stats["skip"] += 1; saved[0] += 4.0
+            return out.reshape(B, S, D)
 
-                elif score <= T2:
-                    # 第二档：中等 → INT4（模拟：用 FP16 计算，精度损失 <1%）
-                    self.stats["int4"] += 1
-                    self.transfer_saved_ms += 3.0  # INT4 传输快 4x，省 3ms
-                    out[t] += w * self.moe.experts[eid](x[t : t + 1])[0]
-
-                else:
-                    # 第三档：不重要 → 真正跳过（不计算）
-                    self.stats["skip"] += 1
-                    self.transfer_saved_ms += 4.0  # 不传输省 4ms
-                    # 不累加到 out → 真正的跳过
-
-        return out.reshape(B, S, D)
+        moe_block.forward = hobbit_forward
 
 
 def load_model():
@@ -224,7 +197,7 @@ def main():
     for h in hobbit_layers:
         for k in total:
             total[k] += h.stats[k]
-        total_saved += h.transfer_saved_ms
+        total_saved += h._saved[0]
 
     all_calls = sum(total.values())
     print(f"Total expert calls: {all_calls}")
