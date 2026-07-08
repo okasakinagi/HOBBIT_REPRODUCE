@@ -21,7 +21,6 @@ if not os.environ.get("HF_ENDPOINT"):
 
 import torch
 from transformers import MixtralForCausalLM, AutoTokenizer
-from datasets import load_dataset
 
 # ============================================================
 # 配置
@@ -96,9 +95,12 @@ def format_mmlu_prompt(question, choices, subject=""):
 
 def evaluate_subject(model, tokenizer, subject, device):
     print(f"\n[MMLU] Subject: {subject}")
-    ds_all = load_dataset("cais/mmlu", subject)
-    ds = ds_all["test"]  # datasets v5: 不传 split 参数，从 dict 取
-    total = min(len(ds), MAX_Q)
+    # 从本地 JSON 加载（预先下载好的 MMLU 数据）
+    import json
+    json_path = os.path.join(os.path.dirname(__file__), f"mmlu_{subject}.json")
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    total = min(len(data), MAX_Q)
     if total == 0:
         print(f"[MMLU]   No questions found, skipping")
         return 0.0
@@ -109,7 +111,7 @@ def evaluate_subject(model, tokenizer, subject, device):
     
     t0 = time.time()
     for i in range(total):
-        item = ds[i]
+        item = data[i]
         prompt = format_mmlu_prompt(item["question"], item["choices"], subject)
         inp = tokenizer(prompt, return_tensors="pt").to(device)
 
