@@ -98,6 +98,9 @@ def evaluate_subject(model, tokenizer, subject, device):
     print(f"\n[MMLU] Subject: {subject}")
     ds = load_dataset("cais/mmlu", subject, split="test")
     total = min(len(ds), MAX_Q)
+    if total == 0:
+        print(f"[MMLU]   No questions found, skipping")
+        return 0.0
     print(f"[MMLU]   Questions: {total}")
 
     correct = 0
