@@ -26,7 +26,7 @@ from transformers import MixtralForCausalLM, AutoTokenizer
 # ============================================================
 # 配置
 # ============================================================
-T1, T2 = 0.6, 0.9
+T1, T2 = 0.3, 0.9  # 论文提到范围 T1=0.3~0.6，用 0.3 让更多专家走 INT4/跳过
 FP16_CACHE_SIZE = 2
 INT4_CACHE_SIZE = 6
 COMPARE_TOKENS = 32
