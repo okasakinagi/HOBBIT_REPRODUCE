@@ -183,18 +183,19 @@ def main():
         device_map = "cpu"
         print("[LOAD] No GPU detected, using CPU (inference will be very slow)")
 
-    # 加载策略：
-    # gate_up_proj 合并（w1+w3→gate_up_proj）在 GPU 上需要 1.75GB 连续显存，
-    # 加载结束后 GPU 已满导致合并 OOM。
-    # 解决：用 disk offload，把部分层临时存磁盘，合并完成后再搬回 GPU
-    print("[LOAD] Using bfloat16 + auto device_map + disk offload...")
-    print("[LOAD] gate_up_proj concat needs 1.75GB, offloading temp layers to disk")
+    # 加载策略：bfloat16 + max_memory（GPU 各 40GB + CPU 兜底）
+    # 94GB 装不进 88GB，必然有 ~6GB 要放 CPU
+    # 不用量化：bfloat16 没有 bitsandbytes 的 meta tensor 问题
+    print("[LOAD] Using bfloat16 + max_memory (40GB/GPU + 200GB CPU)...")
     try:
+        max_memory = {i: "40GB" for i in range(n_gpus)} if n_gpus > 0 else None
+        if max_memory:
+            max_memory["cpu"] = "200GB"
         model = MixtralForCausalLM.from_pretrained(
             model_id,
             torch_dtype=torch.bfloat16,
             device_map="auto",
-            offload_folder="/tmp/mixtral_offload",
+            max_memory=max_memory,
             low_cpu_mem_usage=True,
             local_files_only=bool(local_path),
         )
