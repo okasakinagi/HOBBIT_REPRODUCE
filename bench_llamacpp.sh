@@ -16,6 +16,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LLAMA_DIR="${SCRIPT_DIR}/../llama.cpp"
 MODEL_DIR="${HOME}/models/mixtral-8x7b"
 GGUF_FILE="${MODEL_DIR}/mixtral-8x7b-v0.1.Q4_K_M.gguf"
+GGUF_F16="${MODEL_DIR}/mixtral-8x7b-v0.1.f16.gguf"
 LOG_DIR="${SCRIPT_DIR}/../logs"
 mkdir -p "${LOG_DIR}"
 
@@ -39,18 +40,27 @@ build_llamacpp() {
 
 # ============================================================
 convert_to_gguf() {
-    echo "[bench] Converting safetensors to GGUF (Q4_K_M quant)..."
-    echo "[bench] WARNING: This needs ~100GB RAM and may take 30-60 minutes."
-    
+    echo "[bench] Step 1/2: Converting HF safetensors to GGUF f16..."
+    echo "[bench] RAM available: 251GB, should be enough."
+
     pip install -q sentencepiece
 
     python3 "${LLAMA_DIR}/convert_hf_to_gguf.py" \
         "${MODEL_DIR}" \
-        --outfile "${GGUF_FILE}" \
-        --outtype q4_k_m
+        --outfile "${GGUF_F16}" \
+        --outtype f16
 
-    echo "[bench] GGUF saved to: ${GGUF_FILE}"
-    ls -lh "${GGUF_FILE}"
+    echo "[bench] f16 GGUF saved: $(ls -lh ${GGUF_F16} | awk '{print $5}')"
+
+    echo "[bench] Step 2/2: Quantizing f16 → Q4_K_M..."
+    "${LLAMA_DIR}/build/bin/llama-quantize" \
+        "${GGUF_F16}" "${GGUF_FILE}" Q4_K_M
+
+    echo "[bench] Q4_K_M GGUF saved: $(ls -lh ${GGUF_FILE} | awk '{print $5}')"
+    
+    # 删掉 f16 中间文件省空间（可选，94GB）
+    # rm "${GGUF_F16}"
+    echo "[bench] f16 intermediate kept at: ${GGUF_F16}"
 }
 
 # ============================================================
