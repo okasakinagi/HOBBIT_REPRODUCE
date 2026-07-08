@@ -183,10 +183,11 @@ def main():
         device_map = "cpu"
         print("[LOAD] No GPU detected, using CPU (inference will be very slow)")
 
-    # 8-bit 量化加载
-    # device_map="auto" 会错误 offload 部分层到 CPU meta，改用手动分配：
-    # 每张 GPU 放 16 层，embedding/lm_head 放 GPU 0
-    print("[LOAD] Using 8-bit quantization + manual device_map (16 layers per GPU)...")
+    # 8-bit 量化 + 手动 device_map
+    # GPU 0: 层 0-14 (15层) + embedding + norm + lm_head
+    # GPU 1: 层 15-31 (17层)
+    # GPU 0 少放一层，留给 gate_up_proj 合并时需要的 1.75GB 连续显存
+    print("[LOAD] Using 8-bit quantization + manual device_map (15+17 layers)...")
     try:
         bnb_config = BitsAndBytesConfig(load_in_8bit=True)
         device_map = {
@@ -195,13 +196,14 @@ def main():
             "lm_head": 0,
         }
         for i in range(32):
-            device_map[f"model.layers.{i}"] = 0 if i < 16 else 1
+            device_map[f"model.layers.{i}"] = 0 if i < 15 else 1
 
-        print(f"[LOAD] Manual device_map: GPU0=layers 0-15+embed+norm+head, GPU1=layers 16-31")
+        print(f"[LOAD] Manual device_map: GPU0=layers 0-14+embed+norm+head, GPU1=layers 15-31")
         model = MixtralForCausalLM.from_pretrained(
             model_id,
             quantization_config=bnb_config,
             device_map=device_map,
+            low_cpu_mem_usage=True,
             local_files_only=bool(local_path),
         )
     except Exception as e:
