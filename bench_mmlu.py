@@ -15,6 +15,7 @@ bench_mmlu.py — MMLU 精度评测
 """
 
 import sys, os, time
+
 os.environ["HF_HUB_ENABLE_HF_XET"] = "0"
 if not os.environ.get("HF_ENDPOINT"):
     os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
@@ -26,12 +27,16 @@ from transformers import MixtralForCausalLM, AutoTokenizer
 # 配置
 # ============================================================
 HOBBIT_CONFIG = {"T1": 0.6, "T2": 0.9}
-SUBJECTS = os.environ.get("MMLU_SUBJECTS", "high_school_physics,high_school_mathematics,professional_law").split(",")
-MAX_Q = int(os.environ.get("MMLU_MAX_QUESTIONS", "0") or "9999")
+SUBJECTS = os.environ.get(
+    "MMLU_SUBJECTS", "high_school_physics,high_school_mathematics,professional_law"
+).split(",")
+_mq = os.environ.get("MMLU_MAX_QUESTIONS", "")
+MAX_Q = int(_mq) if _mq else 9999
 
 
 def make_hobbit_forward(stats):
     """和 server_hobbit.py 完全一致的 HOBBIT 猴子补丁"""
+
     def f(self, hidden_states):
         B, S, D = hidden_states.shape
         x = hidden_states.view(-1, D)
@@ -39,11 +44,12 @@ def make_hobbit_forward(stats):
         idx_cpu = top_k_index.cpu().numpy()
         w_cpu = top_k_weights.cpu().numpy()
         for t in range(B * S):
-            tw = w_cpu[t].sum(); cum = 0.0
+            tw = w_cpu[t].sum()
+            cum = 0.0
             for i in range(len(idx_cpu[t])):
                 eid = int(idx_cpu[t][i])
                 score = 0.0 if i == 0 else cum / tw
-                cum += w_cpu[t][i-1] if i > 0 else 0
+                cum += w_cpu[t][i - 1] if i > 0 else 0
                 if score <= HOBBIT_CONFIG["T1"]:
                     stats["hit" if eid in stats["cache"] else "miss"] += 1
                 elif score <= HOBBIT_CONFIG["T2"]:
@@ -52,6 +58,7 @@ def make_hobbit_forward(stats):
                     stats["skip"] += 1
         x = self.experts(x, top_k_index, top_k_weights)
         return x.reshape(B, S, D)
+
     return f
 
 
@@ -67,7 +74,9 @@ def load_model_with_hobbit():
         model_id,
         torch_dtype=torch.bfloat16,
         device_map="auto",
-        max_memory=({i: "40GB" for i in range(n_gpus)} | ({"cpu": "200GB"} if n_gpus else {})),
+        max_memory=(
+            {i: "40GB" for i in range(n_gpus)} | ({"cpu": "200GB"} if n_gpus else {})
+        ),
         low_cpu_mem_usage=True,
         local_files_only=local,
     )
@@ -97,7 +106,10 @@ def evaluate_subject(model, tokenizer, subject, device):
     print(f"\n[MMLU] Subject: {subject}")
     # 从本地 JSON 加载（预先下载好的 MMLU 数据）
     import json
-    json_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"mmlu_{subject}.json")
+
+    json_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), f"mmlu_{subject}.json"
+    )
     if not os.path.exists(json_path):
         print(f"[MMLU]   File not found: {json_path}")
         print(f"[MMLU]   CWD: {os.getcwd()}")
@@ -112,7 +124,7 @@ def evaluate_subject(model, tokenizer, subject, device):
 
     correct = 0
     letter_ids = {l: tokenizer.encode(l, add_special_tokens=False)[0] for l in "ABCD"}
-    
+
     t0 = time.time()
     for i in range(total):
         item = data[i]
@@ -133,7 +145,9 @@ def evaluate_subject(model, tokenizer, subject, device):
 
         if (i + 1) % 10 == 0:
             dt = time.time() - t0
-            print(f"[MMLU]   {i+1}/{total}, acc={correct/(i+1)*100:.1f}%, {dt/(i+1):.1f}s/q")
+            print(
+                f"[MMLU]   {i+1}/{total}, acc={correct/(i+1)*100:.1f}%, {dt/(i+1):.1f}s/q"
+            )
 
     acc = correct / total * 100
     dt = time.time() - t0
