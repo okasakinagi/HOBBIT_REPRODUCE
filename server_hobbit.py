@@ -183,26 +183,18 @@ def main():
         device_map = "cpu"
         print("[LOAD] No GPU detected, using CPU (inference will be very slow)")
 
-    # 8-bit 量化 + 手动 device_map
-    # GPU 0: 层 0-14 (15层) + embedding + norm + lm_head
-    # GPU 1: 层 15-31 (17层)
-    # GPU 0 少放一层，留给 gate_up_proj 合并时需要的 1.75GB 连续显存
-    print("[LOAD] Using 8-bit quantization + manual device_map (15+17 layers)...")
+    # 加载策略：
+    # gate_up_proj 合并（w1+w3→gate_up_proj）在 GPU 上需要 1.75GB 连续显存，
+    # 加载结束后 GPU 已满导致合并 OOM。
+    # 解决：用 disk offload，把部分层临时存磁盘，合并完成后再搬回 GPU
+    print("[LOAD] Using bfloat16 + auto device_map + disk offload...")
+    print("[LOAD] gate_up_proj concat needs 1.75GB, offloading temp layers to disk")
     try:
-        bnb_config = BitsAndBytesConfig(load_in_8bit=True)
-        device_map = {
-            "model.embed_tokens": 0,
-            "model.norm": 0,
-            "lm_head": 0,
-        }
-        for i in range(32):
-            device_map[f"model.layers.{i}"] = 0 if i < 15 else 1
-
-        print(f"[LOAD] Manual device_map: GPU0=layers 0-14+embed+norm+head, GPU1=layers 15-31")
         model = MixtralForCausalLM.from_pretrained(
             model_id,
-            quantization_config=bnb_config,
-            device_map=device_map,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            offload_folder="/tmp/mixtral_offload",
             low_cpu_mem_usage=True,
             local_files_only=bool(local_path),
         )
