@@ -32,12 +32,11 @@ layer0 = model.model.layers[0]
 for name, module in layer0.named_children():
     print(f"   - {name}: {module.__class__.__name__}")
 
-# 找到MoE层（在新版transformers中，MoE层属性名是mlp，类型是MixtralSparseMoeBlock）
+# 找到MoE层
 moe_layer = None
 moe_attr_name = None
 for name, module in layer0.named_children():
-    class_name = module.__class__.__name__
-    if "Moe" in class_name or "Sparse" in class_name:
+    if "moe" in name.lower() or "expert" in name.lower() or "sparse" in name.lower():
         moe_layer = module
         moe_attr_name = name
         break

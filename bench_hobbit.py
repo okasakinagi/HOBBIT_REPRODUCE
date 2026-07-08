@@ -8,6 +8,7 @@ bench_hobbit.py — HOBBIT 吞吐量基准测试
 """
 
 import sys, os, time
+
 os.environ["HF_HUB_ENABLE_HF_XET"] = "0"
 
 import torch
@@ -31,11 +32,12 @@ def make_hobbit_forward(layer_idx, stats):
         idx_cpu = top_k_index.cpu().numpy()
         w_cpu = top_k_weights.cpu().numpy()
         for t in range(B * S):
-            tw = w_cpu[t].sum(); cum = 0.0
+            tw = w_cpu[t].sum()
+            cum = 0.0
             for i in range(len(idx_cpu[t])):
                 eid = int(idx_cpu[t][i])
                 score = 0.0 if i == 0 else cum / tw
-                cum += w_cpu[t][i-1] if i > 0 else 0
+                cum += w_cpu[t][i - 1] if i > 0 else 0
                 if score <= HOBBIT_CONFIG["T1"]:
                     stats["hit" if eid in stats["cache"] else "miss"] += 1
                 elif score <= HOBBIT_CONFIG["T2"]:
@@ -44,6 +46,7 @@ def make_hobbit_forward(layer_idx, stats):
                     stats["skip"] += 1
         x = self.experts(x, top_k_index, top_k_weights)
         return x.reshape(B, S, D)
+
     return f
 
 
@@ -66,7 +69,8 @@ def main():
         model_id,
         torch_dtype=torch.bfloat16,
         device_map="auto",
-        max_memory={i: "40GB" for i in range(n_gpus)} | ({"cpu": "200GB"} if n_gpus else {}),
+        max_memory={i: "40GB" for i in range(n_gpus)}
+        | ({"cpu": "200GB"} if n_gpus else {}),
         low_cpu_mem_usage=True,
         local_files_only=local,
     )
@@ -76,7 +80,9 @@ def main():
     print("[BENCH] Patching MoE layers...")
     for layer in model.model.layers:
         s = {"hit": 0, "miss": 0, "int4": 0, "skip": 0, "cache": {0, 1}}
-        layer.mlp.forward = make_hobbit_forward(0, s).__get__(layer.mlp, type(layer.mlp))
+        layer.mlp.forward = make_hobbit_forward(0, s).__get__(
+            layer.mlp, type(layer.mlp)
+        )
     print("[BENCH] Patch done")
 
     # 加载 tokenizer
@@ -114,7 +120,12 @@ def main():
         torch.cuda.synchronize()
         t0 = time.time()
         with torch.no_grad():
-            gen_out = model.generate(**inp, max_new_tokens=GEN_TOKENS, do_sample=False, pad_token_id=tokenizer.eos_token_id)
+            gen_out = model.generate(
+                **inp,
+                max_new_tokens=GEN_TOKENS,
+                do_sample=False,
+                pad_token_id=tokenizer.eos_token_id,
+            )
         torch.cuda.synchronize()
         dt = time.time() - t0
         new_tokens = gen_out.shape[1] - actual_len
@@ -134,7 +145,9 @@ def main():
     print(f"  llama.cpp ngl=0:  pp512=6.9  tg128=6.9")
     print(f"  llama.cpp ngl=20: pp512=17.3 tg128=16.2")
     print(f"  llama.cpp ngl=32: pp512=124.9 tg128=74.0")
-    print(f"[BENCH] HOBBIT target: close to ngl=32 by eliminating transfer stalls via INT4 fallback.")
+    print(
+        f"[BENCH] HOBBIT target: close to ngl=32 by eliminating transfer stalls via INT4 fallback."
+    )
 
 
 if __name__ == "__main__":
