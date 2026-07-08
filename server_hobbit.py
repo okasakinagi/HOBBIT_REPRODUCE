@@ -183,13 +183,21 @@ def main():
         device_map = "cpu"
         print("[LOAD] No GPU detected, using CPU (inference will be very slow)")
 
-    # 8-bit 量化加载：Mixtral-8x7B FP16 = 94GB > 2xL20(88GB)，必须压缩
-    # 用 bitsandbytes LLM.int8() 把模型压到 ~47GB（8-bit 无 4-bit 的 CPU dispatch 校验死循环）
-    # 注意：不追求 4-bit 的极致压缩，47GB 在 88GB 显存中绰绰有余
-    print("[LOAD] Using 8-bit quantization (bitsandbytes LLM.int8) to fit GPU memory...")
-    print("[LOAD] Mixtral-8x7B FP16=94GB > 2xL20(88GB), 8-bit (~47GB) fits in 88GB")
+    # 8-bit 量化加载
+    # device_map="auto" 会错误 offload 部分层到 CPU meta，改用手动分配：
+    # 每张 GPU 放 16 层，embedding/lm_head 放 GPU 0
+    print("[LOAD] Using 8-bit quantization + manual device_map (16 layers per GPU)...")
     try:
         bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+        device_map = {
+            "model.embed_tokens": 0,
+            "model.norm": 0,
+            "lm_head": 0,
+        }
+        for i in range(32):
+            device_map[f"model.layers.{i}"] = 0 if i < 16 else 1
+
+        print(f"[LOAD] Manual device_map: GPU0=layers 0-15+embed+norm+head, GPU1=layers 16-31")
         model = MixtralForCausalLM.from_pretrained(
             model_id,
             quantization_config=bnb_config,
