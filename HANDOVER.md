@@ -6,7 +6,7 @@
 
 核心目标：在 MoE 大模型推理时，遇到 GPU 显存中没有的专家（Cache Miss），不阻塞等待 FP16 高精度专家从 CPU 传输到 GPU，而是动态切换到 INT4 低精度版本计算，用极小精度损失换取完全无卡顿的推理体验。
 
-硬件条件：实验室服务器有两张 NVIDIA L20（48GB 显存），足够加载全量 Mixtral-8x7B 模型。
+硬件条件：实验室服务器有两张 NVIDIA L20（44GB 显存/卡，总计 88GB），Mixtral-8x7B bfloat16 约 94GB 无法全放 GPU。
 
 **重要：本复现采用纯 Python/PyTorch 路线。论文原版修改了 llama.cpp（C++），我们不修改 C++ 源码，而是用 HuggingFace transformers + PyTorch 在 Python 层面实现 HOBBIT 全部核心逻辑，llama.cpp 仅作为性能基准对照组使用原版即可。**
 
@@ -32,8 +32,9 @@ g:\moe\
 ├── inspect_mixtral.py       ← Mixtral 结构探查脚本（已跑通）
 ├── mixtral_hobbit_empty.py  ← HOBBIT 缝合迷你模型（已跑通）
 │
-├── [阶段3：服务器部署 — 进行中]
+├── [阶段3：服务器部署 — 功能验证完成]
 ├── server_hobbit.py         ← 服务器主脚本（环境自检+加载+缝合+验证）
+├── server_hobbit_local.py   ← 本机 2 层真实权重测试脚本
 ├── run.sh                   ← 服务器一键运行（download/dry/bg/fg 四种模式）
 ```
 
@@ -65,42 +66,41 @@ g:\moe\
 - 输入 `[1, 32]` -> 输出 logits `[1, 32, 32000]`
 - FP16 命中率 6.2%，INT4 使用率 50%，跳过率 0%（初始缓存仅 2 个 FP16 专家）
 
-### 阶段3：服务器部署（模型加载卡点，暂停中）
+### 阶段3：服务器部署（2026-07-08 完成功能验证）
 
 **已完成：**
-- 模型权重下载到服务器本地（`~/models/mixtral-8x7b`，94GB）
+- 模型权重下载到服务器本地（`~/models/mixtral-8x7b`，89GB safetensors，已删重复的 96GB .pt 文件）
 - HF-Mirror 镜像站下载链路调通
 - `run.sh` 一键脚本（download/dry/bg/fg 四种模式）
 - 环境自检通过（2x L20 各 44GB，CUDA 13.2）
-- `server_hobbit.py` 代码就绪（环境自检 + HOBBIT 缝合 + 统计逻辑）
+- **模型加载成功 + HOBBIT 缝合 + 推理验证全部跑通**
 
-**当前卡点：模型加载 OOM，6 次尝试均失败**
+**最终可用方案：bfloat16 + max_memory(40GB/GPU + 200GB CPU)**
 
-Mixtral-8x7B FP16 = 94GB，2x L20 = 88GB（实际可用 ~44GB x2）。无论 4-bit 还是 8-bit 量化，加载过程的 GPU 内存管理均存在问题。
+经过 8 次尝试，发现：
+- 4-bit/8-bit bitsandbytes 量化在当前 PyTorch 2.12 + CUDA 13.2 环境下实际未生效（加载后 dtype 仍为 bfloat16）
+- gate_up_proj 权重合并（w1+w3 → gate_up）在 GPU 加载完成后做，需要 1-2GB 连续显存，是反复 OOM 的真正根因
+- `max_memory` 主动限制每卡 40GB，剩余 ~4GB×2 + CPU 200GB 兜底，gate_up_proj 合并在 CPU 上完成
+- 代价：层 28-31 在 CPU（meta），推理时自动 fallback，比全 GPU 慢但能跑
 
-**加载策略演进（6 次尝试）：**
+**验证结果**（真实 Mixtral-8x7B，输入 "Hello, how are you?" 7 tokens）：
+- 输出 logits shape `[1, 7, 32000]`，Top-5 预测合理
+- 推理耗时 3.45s（CPU offload 4 层）
+- HOBBIT 决策统计：FP16 命中 14.5%，FP16 Miss 50.4%，INT4 计划 30.6%，跳过 4.5%
+- 合计 81.0% 的专家调用会使用 INT4（论文核心指标）
+
+**加载策略完整演进（8 次）：**
 
 | # | 方案 | 结果 |
 |---|------|------|
 | 1 | `device_map="auto"` + `BitsAndBytesConfig(4bit)` | 校验拒绝 CPU dispatch |
-| 2 | `device_map={"":0}` + `BitsAndBytesConfig(4bit)` | 单卡 OOM（峰值 44.35/44.39GB） |
-| 3 | `device_map="auto"` + CPU offload + `llm_int8_enable_fp32_cpu_offload` | 加载成功，但层 28-31 meta 状态，推理崩溃 |
-| 4 | `device_map="auto"` + `max_memory` 各 42GB + `BitsAndBytesConfig(4bit)` | 校验拒绝 CPU dispatch |
-| 5 | `load_in_4bit=True` 直接传参 + `device_map="auto"` | `__init__` 不接受 `load_in_4bit` |
-| 6 | `BitsAndBytesConfig(load_in_8bit=True)` + `device_map="auto"` | 8-bit ~47GB 理论够，但仍 OOM |
-
-**卡点分析（推测）：**
-- bitsandbytes 量化加载不是逐层 stream 的——它批量加载 shard 到 GPU 做量化，中间 FP16 张量瞬间撑爆单卡
-- `device_map="auto"` 在多 GPU 环境下可能没有均匀分摊加载压力，某一瞬间一张卡负载过高
-- `gate_up_proj` 权重合并（w1, w3 -> gate_up）在 GPU 上做 concat，需要连续大块显存
-- 两张 L20 跨卡通信可能是隐性问题——P2P 带宽或显存碎片导致某张卡实际可用量更低
-
-**后续可尝试的方向（暂停实验，先整理思路）：**
-1. 先单卡加载一个小模型验证 HOBBIT 缝合逻辑正确性（如 Mistral-7B 非 MoE，或 Qwen2-MoE 小版本）
-2. 用 `accelerate` 做纯 CPU 离线量化（先加载到 CPU 做 4-bit，再 `to("cuda")`），避开 GPU 上的中间 FP16 状态
-3. 换用 GPTQ 或 AWQ 量化权重（预先量化好，加载时直接上 GPU，无中间态）
-4. 单卡加载：用 `device_map="auto"` 但限制只用 GPU 0 + CPU offload（而非双卡），让 accelerate 单线程分配
-5. 检查 `accelerate` 和 `bitsandbytes` 版本兼容性——服务端 PyTorch 2.12 + CUDA 13.2 组合较新，可能存在未修复的 bug
+| 2 | `device_map={"":0}` + `BitsAndBytesConfig(4bit)` | 单卡 OOM |
+| 3 | `device_map="auto"` + CPU offload + 4bit | 加载成功，meta tensor 推理崩溃 |
+| 4 | `device_map="auto"` + max_memory 42GB + 4bit | 校验拒绝 CPU dispatch |
+| 5 | `load_in_4bit=True` 直接传参 | `__init__` 不接受 |
+| 6 | `BitsAndBytesConfig(load_in_8bit=True)` + manual 15/17 layers | gate_up_proj concat OOM |
+| 7 | bfloat16 + `offload_folder` | gate_up_proj concat OOM |
+| 8 | **bfloat16 + max_memory(40GB/GPU + 200GB CPU)** | **成功** |
 
 ---
 
@@ -119,10 +119,11 @@ Mixtral-8x7B FP16 = 94GB，2x L20 = 88GB（实际可用 ~44GB x2）。无论 4-b
 | 3.5 功能验证 | batch=1, seq_len=32 跑通真实推理 | 输出 logits 正确，打印 HOBBIT 降级日志 |
 
 **验收门禁（阶段3）：**
-- [x] 3.1 环境准备：服务器 CUDA 13.2、bitsandbytes 0.49.2、PyTorch 2.12 就绪
-- [x] 3.2 模型下载：已下载到本地 `~/models/mixtral-8x7b`（94GB）
-- [ ] 3.2 加载成功：6 次尝试均 OOM，暂停，需换策略
-- [ ] 3.4-3.5 缝合 HOBBIT + 功能验证：代码就绪，等加载问题解决后可直接跑
+- [x] 3.1 环境准备：服务器 CUDA 13.2、PyTorch 2.12 就绪
+- [x] 3.2 模型下载：已下载到本地 `~/models/mixtral-8x7b`（89GB safetensors）
+- [x] 3.2 加载成功：第 8 次尝试成功——bfloat16 + max_memory(40GB/GPU + 200GB CPU)
+- [x] 3.4 缝合 HOBBIT：32 层全部替换成功
+- [x] 3.5 功能验证：输出 logits 正确，三种路径均被触发（14.5%/81.0%/4.5%）
 
 ---
 
@@ -247,11 +248,11 @@ print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] DONE")
 
 ### 下一步操作（按优先级）
 
-1. **解决模型加载 OOM**：6 次尝试均失败（4-bit/8-bit + 多种 device_map 组合），怀疑是 bitsandbytes 加载时的 GPU 中间态内存管理问题或双卡分布问题。建议先换小模型验证逻辑、或用预量化权重（GPTQ/AWQ）绕过
-2. **跑通功能验证**：模型加载成功后，验证 HOBBIT 决策三层路径（FP16命中 / INT4降级 / 跳过）
-3. **性能测试**：跑基准对比（llama.cpp 原版、MoE-Infinity）
-4. **精度测试**：跑 MMLU/GSM8K 子集
-5. **消融实验**：分别关闭三大创新，量化各自贡献
+1. **已完成**：模型加载 + HOBBIT 缝合 + 功能验证全部跑通
+2. **性能测试**：跑基准对比（llama.cpp 原版、MoE-Infinity），日志重定向
+3. **精度测试**：跑 MMLU/GSM8K 子集
+4. **消融实验**：分别关闭三大创新，量化各自贡献
+5. **优化**：将层 28-31 从 CPU 搬回 GPU（需 INT4 量化真正生效后）
 
 ---
 
@@ -300,5 +301,6 @@ print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] DONE")
 | Xet CAS 401 错误 | `HF_HUB_ENABLE_HF_XET=0` 必须设在所有 import 之前 |
 | `load_in_4bit` 不能直接传 `from_pretrained` | 新版须用 `BitsAndBytesConfig`，但有校验死循环 |
 | `BitsAndBytesConfig` + `device_map` 死循环 | 校验拒绝 CPU dispatch；绕过用 `load_in_4bit=True` 旧式参数 |
-| CPU offload -> meta tensor 崩溃 | bitsandbytes 4-bit 权重无法处理 meta tensor |
-| 单卡加载 OOM | 4-bit 加载先创建 FP16 中间张量再量化，瞬时内存 > 44GB |
+| `BitsAndBytesConfig` 4-bit/8-bit 量化不生效 | 加载后 dtype 仍为 bfloat16；最终放弃量化直接用 bfloat16 + CPU offload |
+| gate_up_proj 合并 OOM（反复出现） | 合并发生在加载末尾 GPU 已满时；max_memory 限制每卡 40GB + CPU 兜底解决 |
+| 下载了 178GB（实际只需 89GB） | `hf download` 下载了 safetensors + consolidated.pt 两份，删 .pt 省 96GB |
