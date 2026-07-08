@@ -97,7 +97,11 @@ def evaluate_subject(model, tokenizer, subject, device):
     print(f"\n[MMLU] Subject: {subject}")
     # 从本地 JSON 加载（预先下载好的 MMLU 数据）
     import json
-    json_path = os.path.join(os.path.dirname(__file__), f"mmlu_{subject}.json")
+    json_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"mmlu_{subject}.json")
+    if not os.path.exists(json_path):
+        print(f"[MMLU]   File not found: {json_path}")
+        print(f"[MMLU]   CWD: {os.getcwd()}")
+        return 0.0
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
     total = min(len(data), MAX_Q)
