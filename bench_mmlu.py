@@ -96,7 +96,8 @@ def format_mmlu_prompt(question, choices, subject=""):
 
 def evaluate_subject(model, tokenizer, subject, device):
     print(f"\n[MMLU] Subject: {subject}")
-    ds = load_dataset("cais/mmlu", subject, split="test")
+    ds_all = load_dataset("cais/mmlu", subject)
+    ds = ds_all["test"]  # datasets v5: 不传 split 参数，从 dict 取
     total = min(len(ds), MAX_Q)
     if total == 0:
         print(f"[MMLU]   No questions found, skipping")
