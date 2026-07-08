@@ -41,7 +41,9 @@ def env_check():
         for i in range(torch.cuda.device_count()):
             p = torch.cuda.get_device_properties(i)
             free, total = torch.cuda.mem_get_info(i)
-            print(f"[ENV] GPU[{i}]: {p.name}, total={total//1024**3}GB, free={free//1024**3}GB")
+            print(
+                f"[ENV] GPU[{i}]: {p.name}, total={total//1024**3}GB, free={free//1024**3}GB"
+            )
 
 
 # ============================================================
@@ -86,6 +88,7 @@ def make_hobbit_forward(layer_idx, stats):
         # Step 3: 原生专家计算（本机不搞量化，都用原权重）
         x = self.experts(x, top_k_index, top_k_weights)
         return x.reshape(B, S, D)
+
     return hobbit_forward
 
 
@@ -121,15 +124,23 @@ def main():
         used = torch.cuda.memory_allocated(0) / 1024**3
         print(f"[LOAD] GPU memory used: {used:.1f}GB / {total/1024**3:.0f}GB")
 
-    print(f"[LOAD] Layers: {config.num_hidden_layers}, "
-          f"Experts: {config.num_local_experts}, Top-K: {config.num_experts_per_tok}")
+    print(
+        f"[LOAD] Layers: {config.num_hidden_layers}, "
+        f"Experts: {config.num_local_experts}, Top-K: {config.num_experts_per_tok}"
+    )
 
     # --- 3b. 替换 MoE 层 ---
     print(f"\n[{time.strftime('%H:%M:%S')}] Patching MoE layers with HOBBIT forward...")
     per_layer = []
     for i, layer in enumerate(model.model.layers):
-        s = {"layer": i, "hit_fp16": 0, "miss_fp16": 0, "use_int4": 0, "skip": 0,
-             "fp16_cache": {0, 1}}
+        s = {
+            "layer": i,
+            "hit_fp16": 0,
+            "miss_fp16": 0,
+            "use_int4": 0,
+            "skip": 0,
+            "fp16_cache": {0, 1},
+        }
         per_layer.append(s)
         moe = layer.mlp
         moe.forward = make_hobbit_forward(i, s).__get__(moe, type(moe))
@@ -155,13 +166,17 @@ def main():
 
     # --- 3d. 统计 ---
     print(f"\n[{time.strftime('%H:%M:%S')}] HOBBIT Statistics:")
-    print(f"{'Layer':>6} {'FP16-Hit':>10} {'FP16-Miss':>10} {'INT4':>10} {'Skip':>10} {'Hit%':>8}")
+    print(
+        f"{'Layer':>6} {'FP16-Hit':>10} {'FP16-Miss':>10} {'INT4':>10} {'Skip':>10} {'Hit%':>8}"
+    )
     print("-" * 56)
     for s in per_layer:
         t = s["hit_fp16"] + s["miss_fp16"] + s["use_int4"] + s["skip"]
         pct = s["hit_fp16"] / t * 100 if t else 0
-        print(f"{s['layer']:>6} {s['hit_fp16']:>10} {s['miss_fp16']:>10} "
-              f"{s['use_int4']:>10} {s['skip']:>10} {pct:>7.1f}%")
+        print(
+            f"{s['layer']:>6} {s['hit_fp16']:>10} {s['miss_fp16']:>10} "
+            f"{s['use_int4']:>10} {s['skip']:>10} {pct:>7.1f}%"
+        )
 
     # 内存报告
     if n_gpus > 0:

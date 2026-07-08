@@ -36,6 +36,11 @@ g:\moe\
 ├── server_hobbit.py         ← 服务器主脚本（环境自检+加载+缝合+验证）
 ├── server_hobbit_local.py   ← 本机 2 层真实权重测试脚本
 ├── run.sh                   ← 服务器一键运行（download/dry/bg/fg 四种模式）
+│
+├── [阶段4：基准对比与性能评测 — 进行中]
+├── bench_llamacpp.sh        ← llama.cpp 基准测试脚本
+├── bench_hobbit.py          ← HOBBIT 吞吐量基准测试
+├── llama.cpp.log            ← llama.cpp 基准原始输出
 ```
 
 ---
@@ -302,17 +307,21 @@ print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] DONE")
 
 ---
 
-## 十、已解决的坑
+## 十、问题与解决方案对照总表
 
-| 问题 | 解决方案 |
-|------|----------|
-| MoE 层属性名找不到 | 新版 transformers 中属性名是 `mlp`，类型 `MixtralSparseMoeBlock` |
-| forward 返回值类型不匹配 | 类型标注是 tuple 但实际只返回单个 tensor |
-| `init_empty_weights` 后 `.to("cpu")` 报错 | meta tensor 不能 `.to()`，迷你模型正常创建即可 |
-| `huggingface-cli` 已废弃 | 新版用 `hf download` 替代 |
-| Xet CAS 401 错误 | `HF_HUB_ENABLE_HF_XET=0` 必须设在所有 import 之前 |
-| `load_in_4bit` 不能直接传 `from_pretrained` | 新版须用 `BitsAndBytesConfig`，但有校验死循环 |
-| `BitsAndBytesConfig` + `device_map` 死循环 | 校验拒绝 CPU dispatch；绕过用 `load_in_4bit=True` 旧式参数 |
-| `BitsAndBytesConfig` 4-bit/8-bit 量化不生效 | 加载后 dtype 仍为 bfloat16；最终放弃量化直接用 bfloat16 + CPU offload |
-| gate_up_proj 合并 OOM（反复出现） | 合并发生在加载末尾 GPU 已满时；max_memory 限制每卡 40GB + CPU 兜底解决 |
-| 下载了 178GB（实际只需 89GB） | `hf download` 下载了 safetensors + consolidated.pt 两份，删 .pt 省 96GB |
+| # | 阶段 | 问题 | 现象 | 根因 | 解决方案 |
+|---|------|------|------|------|----------|
+| 1 | 阶段2 | MoE 层属性名找不到 | `AttributeError: 'NoneType'` | 新版 transformers 属性名是 `mlp`，类型 `MixtralSparseMoeBlock`，不是 `moe`/`block_sparse_moe` | 按类名 `MixtralSparseMoeBlock` 搜索而非按属性名 |
+| 2 | 阶段2 | forward 返回值不匹配 | `TypeError: + for Tensor and tuple` | 类型标注说返回 tuple，实际只返回单个 tensor | 返回单个 tensor 即可 |
+| 3 | 阶段2 | `init_empty_weights` 后 `.to("cpu")` 报错 | `NotImplementedError: Cannot copy out of meta tensor` | meta tensor 没有实际数据，不能 `.to()` | 迷你模型直接正常创建（仅 21M 参数） |
+| 4 | 阶段3 | `huggingface-cli` 已废弃 | `Warning: huggingface-cli is deprecated` | 新版 huggingface_hub 用 `hf` 命令 | 改用 `hf download` |
+| 5 | 阶段3 | Xet CAS 401 错误 | `RuntimeError: CAS Client Error: 401 @ cas-server.xethub.hf.co` | HF-Mirror 不支持 Xet 存储协议 | `HF_HUB_ENABLE_HF_XET=0` 必须在所有 huggingface import 之前 |
+| 6 | 阶段3 | `hf download` 参数错误 | `Error: No such option '--local-dir-use-symlinks'` | `hf` 命令参数名与 `huggingface-cli` 不同 | 去掉不支持的参数 |
+| 7 | 阶段3 | Shell 单引号嵌套语法错 | `syntax error near unexpected token '$MODEL_ID'` | `python3 -c "..."` 内单引号被 shell 解析 | 改用 heredoc: `python3 << PYEOF ... PYEOF` |
+| 8 | 阶段3 | 下载了 178GB（实际只需 89GB） | `total 178G` | `hf download` 下载了 safetensors + `consolidated.*.pt` 两份 | 删 `.pt` 文件省 96GB |
+| 9 | 阶段3 | `BitsAndBytesConfig` 4-bit 校验死循环 | `ValueError: Some modules dispatched on CPU` | 4-bit 量化器硬编码拒绝 CPU dispatch，但 2x44GB 必须分摊 | 弃用 4-bit，换 8-bit 或 bfloat16 |
+| 10 | 阶段3 | `load_in_4bit` 不能直接传参 | `TypeError: unexpected keyword argument 'load_in_4bit'` | 新版 transformers 必须通过 `BitsAndBytesConfig` 传量化参数 | 用 `BitsAndBytesConfig`（但后又因校验问题放弃） |
+| 11 | 阶段3 | bitsandbytes 4-bit/8-bit 量化不生效 | `dtype: torch.bfloat16`（应为 int8） | PyTorch 2.12 + CUDA 13.2 组合下量化静默失败 | 放弃量化，直接用 bfloat16 + CPU offload |
+| 12 | 阶段3 | gate_up_proj 合并 OOM（核心顽固问题） | `CUDA out of memory. Tried to allocate 896MiB-1.75GiB` | 加载末尾 `w1`+`w3`→`gate_up` concat 需连续显存，GPU 已满 | 第 8 次 `max_memory={0:"40GB",1:"40GB","cpu":"200GB"}` 成功：GPU 留余量，合并在 CPU 做 |
+| 13 | 阶段3 | CPU offload 导致 meta tensor 推理崩溃 | `NotImplementedError: Cannot copy out of meta tensor` | bitsandbytes 4-bit + CPU offload 产生 meta 状态层 | 换 bfloat16（无 meta tensor 问题）+ max_memory |
+| 14 | 阶段3 | `convert_hf_to_gguf.py` 参数不兼容 | `invalid choice: 'q4_k_m'` | 新版 llama.cpp 的 convert 脚本只做格式转换，不量化 | 两步：先 `--outtype f16` 转格式，再 `llama-quantize Q4_K_M` |
