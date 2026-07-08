@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import MixtralConfig, MixtralForCausalLM
-from accelerate import init_empty_weights
 from typing import Optional, Tuple
 
 # ========================================================
@@ -86,7 +85,10 @@ class HobbitSparseMoeBlock(nn.Module):
         self.miss_count = 0
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """MoE层前向传播，和原生结构完全一致，插入HOBBIT逻辑"""
+        """MoE层前向传播，和原生结构完全一致，插入HOBBIT逻辑
+        注意：虽然类型标注是tuple，但原生实际只返回hidden_states单个tensor
+        router_logits通过transformers的OutputRecorder机制单独收集
+        """
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(
             -1, hidden_dim
@@ -156,7 +158,7 @@ class HobbitSparseMoeBlock(nn.Module):
 
             final_hidden_states[token_idx] = token_output
 
-        # 3. 返回和输入形状一致的输出（和原生完全一致）
+        # 3. 返回和输入形状一致的输出（和原生完全一致，只返回hidden_states）
         return final_hidden_states.view(batch_size, sequence_length, hidden_dim)
 
     def reset_stats(self):
@@ -182,11 +184,9 @@ if __name__ == "__main__":
     print(
         f"   配置：{config.num_hidden_layers}层，{config.num_local_experts}专家，Top-{config.num_experts_per_tok}，hidden_size={config.hidden_size}"
     )
-
-    # 2. 用init_empty_weights加载空壳模型（不下载权重，不占显存/内存）
-    print("\n2. 加载空壳模型骨架...")
-    with init_empty_weights():
-        model = MixtralForCausalLM(config)
+    # 2. 创建迷你模型（迷你模型才2M参数，CPU完全够用）
+    print("\n2. 创建迷你Mixtral模型（2M参数，CPU完全够用）...")
+    model = MixtralForCausalLM(config)
 
     # 3. 先看看DecoderLayer有哪些属性，找到MoE层的名字
     print("\n3. 查看DecoderLayer结构，找到MoE层位置...")
@@ -199,23 +199,22 @@ if __name__ == "__main__":
     # 替换所有MoE层为我们的HOBBIT版MoE层
     print("\n4. 替换原生MoE层为HOBBIT版MoE层...")
     for layer_idx, layer in enumerate(model.model.layers):
-        # 新版transformers里MoE层叫moe，不是block_sparse_moe
-        if hasattr(layer, "block_sparse_moe"):
-            moe_attr_name = "block_sparse_moe"
-        elif hasattr(layer, "moe"):
-            moe_attr_name = "moe"
-        else:
+        # 新版transformers里MoE层属性名是mlp，类型是MixtralSparseMoeBlock
+        moe_attr_name = None
+        for name, module in layer.named_children():
+            if "MixtralSparseMoeBlock" in module.__class__.__name__:
+                moe_attr_name = name
+                break
+
+        if moe_attr_name is None:
             raise AttributeError(
-                f"找不到MoE层，当前层的属性：{[name for name, _ in layer.named_children()]}"
+                f"找不到MoE层，第{layer_idx}层的属性：{[name for name, _ in layer.named_children()]}"
             )
         # 替换成我们的HOBBIT版
         setattr(layer, moe_attr_name, HobbitSparseMoeBlock(config))
         print(f"   替换第{layer_idx}层MoE层完成（属性名：{moe_attr_name}）")
 
-    # 4. 把模型移到CPU，随机初始化权重（迷你模型很小，CPU瞬间完成）
-    print("\n4. 随机初始化迷你模型权重...")
-    model = model.to("cpu")
-    model.init_weights()
+    # 4. 模型已在CPU上，迷你模型无需额外初始化
     total_params = sum(p.numel() for p in model.parameters())
     print(
         f"   模型总参数量：{total_params/1e6:.2f}M（真实Mixtral-8x7B是47B，缩小了几百倍方便调试）"
@@ -239,7 +238,7 @@ if __name__ == "__main__":
     total_skip = 0
     total_miss = 0
     for layer_idx, layer in enumerate(model.model.layers):
-        moe = layer.block_sparse_moe
+        moe = layer.mlp  # 新版transformers中MoE层属性名是mlp
         total_hit += moe.hit_count
         total_int4 += moe.int4_count
         total_skip += moe.skip_count
@@ -256,7 +255,7 @@ if __name__ == "__main__":
 
     print("\n" + "=" * 70)
     print(
-        "✅ 空壳模型前向传播跑通！HOBBIT逻辑成功缝合到Mixtral结构中，张量形状完全对齐！"
+        "[OK] 空壳模型前向传播跑通！HOBBIT逻辑成功缝合到Mixtral结构中，张量形状完全对齐！"
     )
     print(
         "   上服务器只需要把迷你配置换成真实Mixtral配置，加载真实权重即可，不需要改核心逻辑。"
