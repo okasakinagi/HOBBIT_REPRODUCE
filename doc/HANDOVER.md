@@ -16,34 +16,38 @@
 
 ```
 g:\moe\
-├── HANDOVER.md              ← 本文档
-├── paper.md                 ← 论文核心要点梳理
-├── route.md                 ← 原始复现路线图
+├── [核心脚本 — 根目录]
+├── hobbit.py ~ hobbit_final.py  ← 阶段1：6个仿真脚本
+├── inspect_mixtral.py           ← 阶段2：Mixtral 结构探查
+├── mixtral_hobbit_empty.py      ← 阶段2：HOBBIT 缝合迷你模型
+├── server_hobbit.py             ← 阶段3：服务器主脚本
+├── server_hobbit_local.py       ← 阶段3：本机测试脚本
+├── run.sh                       ← 阶段3：一键运行
+├── bench_llamacpp.sh            ← 阶段4：llama.cpp 基准
+├── bench_hobbit.py              ← 阶段4：HOBBIT 吞吐量基准
+├── bench_mmlu.py                ← 阶段4：MMLU 精度评测
+├── bench_gsm8k.py               ← 阶段4：GSM8K 数学推理评测
+├── hobbit_real.py               ← 阶段4：核心实验（真实混合精度）
 │
-├── [阶段1：算法仿真 — 全部完成]
-├── hobbit.py                ← 最简 Demo（100行，核心 if-else）
-├── hobbit_simulation.py     ← V1 简化版（三对照组 + LRU 缓存）
-├── hobbit_simulation_v2.py  ← V2 严谨版（加载中状态 + 时间驱动）
-├── hobbit_simulation_v3.py  ← V3 最严谨版（PCIe 带宽限制 + 传输队列）
-├── hobbit_paper_aligned.py  ← 论文对齐版（Token决策 + Layer预取 + LHU缓存）
-├── hobbit_final.py          ← 最终版（FP16/INT4 双独立缓存）
+├── doc/                         ← 文档
+│   ├── HANDOVER.md              ← 本文档
+│   ├── paper.md                 ← 论文核心要点梳理
+│   ├── route.md                 ← 原始复现路线图
+│   └── SUMMARY.md               ← AI 摘要
 │
-├── [阶段2：空壳模型对齐 — 全部完成]
-├── inspect_mixtral.py       ← Mixtral 结构探查脚本（已跑通）
-├── mixtral_hobbit_empty.py  ← HOBBIT 缝合迷你模型（已跑通）
+├── data/                        ← 测试数据
+│   ├── mmlu_high_school_mathematics.json
+│   ├── mmlu_high_school_physics.json
+│   ├── mmlu_professional_law.json
+│   └── gsm8k_test.json          ← GSM8K 测试集（1319 题）
 │
-├── [阶段3：服务器部署 — 功能验证完成]
-├── server_hobbit.py         ← 服务器主脚本（环境自检+加载+缝合+验证）
-├── server_hobbit_local.py   ← 本机 2 层真实权重测试脚本
-├── run.sh                   ← 服务器一键运行（download/dry/bg/fg 四种模式）
+├── result/                      ← 输出成果（评测结果 JSON、图表）
 │
-├── [阶段4：基准对比与性能评测 — 核心实验完成]
-├── bench_llamacpp.sh        ← llama.cpp 基准测试脚本
-├── bench_hobbit.py          ← HOBBIT 吞吐量基准测试
-├── bench_mmlu.py            ← MMLU 精度评测脚本
-├── hobbit_real.py           ← HOBBIT 真实混合精度推理（核心实验）
-├── mmlu_*.json              ← MMLU 数据集（3 学科）
-├── llama.cpp.log            ← llama.cpp 基准原始输出
+├── tools/                       ← 工具脚本
+│   ├── download_gsm8k.py        ← GSM8K 数据集下载
+│   └── convert_gsm8k.py         ← Parquet → JSON 转换
+│
+└── log/                         ← 运行日志
 ```
 
 ---
