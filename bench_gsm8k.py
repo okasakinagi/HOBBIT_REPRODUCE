@@ -2,25 +2,41 @@
 bench_gsm8k.py — GSM8K 数学推理精度评测
 =========================================
 在 HOBBIT 缝合版 Mixtral 上跑 GSM8K 数学推理评测。
-使用贪婪解码生成答案，从 "####" 标记提取最终数字。
+支持增量保存 + 断点续跑，适合 nohup 后台长时间运行。
 
-用法：
-    # 1. 基线模式（无 HOBBIT）
-    LOCAL_MODEL_PATH=~/models/mixtral-8x7b python bench_gsm8k.py --mode baseline 2>&1 | tee ../logs/gsm8k_baseline_$(date +%Y%m%d_%H%M%S).log
+用法（服务器 nohup 推荐）：
+    # 基线模式
+    LOCAL_MODEL_PATH=~/models/mixtral-8x7b nohup python bench_gsm8k.py \
+        --mode baseline > ../logs/gsm8k_baseline_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 
-    # 2. HOBBIT 混合精度模式
-    LOCAL_MODEL_PATH=~/models/mixtral-8x7b python bench_gsm8k.py --mode hobbit 2>&1 | tee ../logs/gsm8k_hobbit_$(date +%Y%m%d_%H%M%S).log
+    # HOBBIT 模式
+    LOCAL_MODEL_PATH=~/models/mixtral-8x7b nohup python bench_gsm8k.py \
+        --mode hobbit > ../logs/gsm8k_hobbit_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 
-    # 3. 对比模式（先后跑 baseline 和 HOBBIT，自动对比）
-    LOCAL_MODEL_PATH=~/models/mixtral-8x7b python bench_gsm8k.py --mode compare 2>&1 | tee ../logs/gsm8k_compare_$(date +%Y%m%d_%H%M%S).log
+    # 排队串行（写 shell 脚本 + nohup）
+    LOCAL_MODEL_PATH=~/models/mixtral-8x7b nohup bash -c '
+        GSM8K_MAX_QUESTIONS=20 python bench_gsm8k.py --mode baseline
+        GSM8K_MAX_QUESTIONS=20 python bench_gsm8k.py --mode hobbit
+    ' > ../logs/gsm8k_queued_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+
+    # 断点续跑（如果 checkpoint 存在）
+    LOCAL_MODEL_PATH=~/models/mixtral-8x7b nohup python bench_gsm8k.py \
+        --mode baseline --resume > ../logs/gsm8k_resume_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 
 可选参数：
-    GSM8K_MAX_QUESTIONS=50   # 测试题目数量（默认 20，全量 1319）
-    GSM8K_QUESTION_START=0   # 起始序号
+    --mode baseline|hobbit  评测模式（必选，不支持 compare）
+    --resume                从 checkpoint 续跑（跳过已完成的题目）
+    GSM8K_MAX_QUESTIONS=50  测试题数（默认 20，全量 1319）
+    GSM8K_QUESTION_START=0  起始序号
 
 环境变量：
     HF_ENDPOINT=https://hf-mirror.com   # 国内镜像
     LOCAL_MODEL_PATH=~/models/mixtral-8x7b
+
+注意：
+    - 不支持 compare 模式（需加载两次模型，显存不够）
+    - 每答完一题自动保存 checkpoint 到 ../logs/ 目录
+    - 最终汇总也会保存一份到 result/（本地参考用）
 """
 
 import sys, os, re, json, time, argparse
@@ -43,6 +59,10 @@ Q_START = int(_qs) if _qs else 0
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 DATA_FILE = os.path.join(DATA_DIR, "gsm8k_test.json")
+# checkpoint 放到 ../logs/ 下（服务器只 pull 不 push，../logs/ 不会被 git 覆盖）
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+RESULT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "result")
 
 # GSM8K 8-shot prompt（标准链式推理样例）
 EIGHT_SHOT_EXAMPLES = """Q: There are 15 trees in the grove. Grove workers will plant trees in the grove today. After they are done, there will be 21 trees. How many trees did the grove workers plant today?
@@ -97,6 +117,7 @@ def load_model():
 
 def make_hobbit_forward(stats):
     """HOBBIT 决策逻辑（与 bench_mmlu.py 一致）"""
+
     def f(self, hidden_states):
         B, S, D = hidden_states.shape
         x = hidden_states.view(-1, D)
@@ -118,6 +139,7 @@ def make_hobbit_forward(stats):
                     stats["skip"] += 1
         x = self.experts(x, top_k_index, top_k_weights)
         return x.reshape(B, S, D)
+
     return f
 
 
@@ -147,12 +169,38 @@ def extract_answer(text):
     return ""
 
 
-def evaluate_gsm8k(model, tokenizer, questions, answers, device, max_new_tokens=256):
-    """在 GSM8K 问题上跑推理，返回预测结果"""
+def evaluate_gsm8k(
+    model,
+    tokenizer,
+    questions,
+    answers,
+    device,
+    max_new_tokens=256,
+    checkpoint_path=None,
+    resume=False,
+):
+    """在 GSM8K 问题上跑推理，支持增量 checkpoint + 断点续跑。
+
+    每答完一题立即保存 checkpoint，进程崩溃后可 --resume 续跑。
+    """
     results = []
+    start_idx = 0
+
+    # 续跑：加载已有 checkpoint，跳过已完成的题目
+    if resume and checkpoint_path and os.path.exists(checkpoint_path):
+        with open(checkpoint_path, "r", encoding="utf-8") as f:
+            cp = json.load(f)
+        results = cp.get("results", [])
+        start_idx = len(results)
+        if start_idx > 0:
+            print(
+                f"[GSM8K]   Resuming from checkpoint: {start_idx}/{len(questions)} done"
+            )
+
     t0 = time.time()
 
-    for i, (q, gt) in enumerate(zip(questions, answers)):
+    for i in range(start_idx, len(questions)):
+        q, gt = questions[i], answers[i]
         prompt = EIGHT_SHOT_EXAMPLES + f"Q: {q}\nA:"
         inp = tokenizer(prompt, return_tensors="pt").to(device)
 
@@ -168,23 +216,42 @@ def evaluate_gsm8k(model, tokenizer, questions, answers, device, max_new_tokens=
         input_len = inp["input_ids"].shape[1]
         generated = tokenizer.decode(out[0][input_len:], skip_special_tokens=True)
         pred = extract_answer(generated)
-        correct = (pred == gt)
+        correct = pred == gt
 
-        results.append({
-            "idx": i + Q_START,
-            "question": q,
-            "ground_truth": gt,
-            "prediction": pred,
-            "generated": generated.strip(),
-            "correct": correct,
-        })
+        results.append(
+            {
+                "idx": i + Q_START,
+                "question": q,
+                "ground_truth": gt,
+                "prediction": pred,
+                "generated": generated.strip(),
+                "correct": correct,
+            }
+        )
 
-        if (i + 1) % 5 == 0 or i == len(questions) - 1:
-            dt = time.time() - t0
-            correct_so_far = sum(r["correct"] for r in results)
-            print(f"[GSM8K]   {i+1}/{len(questions)}, "
-                  f"acc={correct_so_far/(i+1)*100:.1f}%, "
-                  f"avg={dt/(i+1):.1f}s/q")
+        # 每答完一题立即保存 checkpoint
+        if checkpoint_path:
+            cp = {
+                "mode": "in_progress",
+                "total": len(questions),
+                "completed": i + 1,
+                "start_idx": Q_START,
+                "results": results,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            with open(checkpoint_path, "w", encoding="utf-8") as f:
+                json.dump(cp, f, ensure_ascii=False, indent=2)
+
+        dt = time.time() - t0
+        correct_so_far = sum(r["correct"] for r in results)
+        elapsed_per_q = dt / (i + 1 - start_idx) if (i + 1 - start_idx) > 0 else 0
+        eta = elapsed_per_q * (len(questions) - i - 1)
+        print(
+            f"[GSM8K]   #{i+1}/{len(questions)} | "
+            f"acc={correct_so_far/(i+1)*100:.1f}% | "
+            f"{dt/(i+1):.1f}s/q | "
+            f"ETA={eta/60:.0f}min"
+        )
 
     return results
 
@@ -215,8 +282,15 @@ def print_results(results, label, elapsed):
 
 def main():
     parser = argparse.ArgumentParser(description="GSM8K Evaluation")
-    parser.add_argument("--mode", choices=["baseline", "hobbit", "compare"],
-                       default="compare", help="evaluation mode")
+    parser.add_argument(
+        "--mode",
+        choices=["baseline", "hobbit"],
+        required=True,
+        help="baseline (全FP16) 或 hobbit (混合精度)",
+    )
+    parser.add_argument(
+        "--resume", action="store_true", help="从 checkpoint 续跑（跳过已完成的题目）"
+    )
     args = parser.parse_args()
     mode = args.mode
 
@@ -231,134 +305,89 @@ def main():
 
     total_available = len(all_data)
     n_questions = min(MAX_Q, total_available - Q_START)
-    subset = all_data[Q_START:Q_START + n_questions]
+    subset = all_data[Q_START : Q_START + n_questions]
     questions = [item["question"] for item in subset]
     answers = [item["answer"] for item in subset]
 
+    # checkpoint 文件放 ../logs/ 下（服务器 git pull 安全区）
+    cp_name = f"gsm8k_checkpoint_{mode}_{Q_START}-{Q_START+n_questions-1}.json"
+    checkpoint_path = os.path.join(LOG_DIR, cp_name)
+
     print(f"{'='*60}")
-    print(f"GSM8K Evaluation — Mode: {mode}")
-    print(f"Questions: {Q_START}-{Q_START + n_questions - 1} ({n_questions}/{total_available})")
+    print(
+        f"GSM8K Evaluation — Mode: {mode.upper()}"
+        + (" (resume)" if args.resume else "")
+    )
+    print(
+        f"Questions: {Q_START}-{Q_START + n_questions - 1} ({n_questions}/{total_available})"
+    )
+    print(f"Checkpoint: {checkpoint_path}")
     print(f"{'='*60}")
 
-    if mode == "baseline":
-        # ---- 基线：全 FP16 ----
-        model, tokenizer = load_model()
-        device = model.device
-        t0 = time.time()
-        results = evaluate_gsm8k(model, tokenizer, questions, answers, device)
-        elapsed = time.time() - t0
-        acc = print_results(results, "BASELINE (FP16)", elapsed)
+    # ---- 加载模型 ----
+    model, tokenizer = load_model()
+    device = model.device
 
-        # 保存结果
-        out_path = os.path.join(DATA_DIR, "..", "result",
-                                f"gsm8k_baseline_{Q_START}-{Q_START+n_questions-1}.json")
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        with open(out_path, "w") as f:
-            json.dump({"mode": "baseline", "accuracy": acc, "results": results}, f, indent=2)
-        print(f"[GSM8K] Saved to {out_path}")
-
-    elif mode == "hobbit":
-        # ---- HOBBIT：混合精度 ----
-        model, tokenizer = load_model()
-        device = model.device
+    # HOBBIT 模式：缝补丁
+    hobbit_stats = None
+    if mode == "hobbit":
         hobbit_stats = patch_hobbit(model)
-        t0 = time.time()
-        results = evaluate_gsm8k(model, tokenizer, questions, answers, device)
-        elapsed = time.time() - t0
-        acc = print_results(results, "HOBBIT (Mixed)", elapsed)
 
-        # 打印 HOBBIT 统计
+    # ---- 跑推理 ----
+    t0 = time.time()
+    results = evaluate_gsm8k(
+        model,
+        tokenizer,
+        questions,
+        answers,
+        device,
+        checkpoint_path=checkpoint_path,
+        resume=args.resume,
+    )
+    elapsed = time.time() - t0
+    acc = print_results(results, mode.upper(), elapsed)
+
+    # ---- 保存最终结果 ----
+    # 1) 保存到 ../logs/（服务器使用）
+    final_out_log = os.path.join(
+        LOG_DIR, f"gsm8k_{mode}_{Q_START}-{Q_START+n_questions-1}.json"
+    )
+    save_data = {
+        "mode": mode,
+        "accuracy": acc,
+        "n_questions": n_questions,
+        "start_idx": Q_START,
+        "elapsed": elapsed,
+        "results": results,
+    }
+    if hobbit_stats:
+        save_data["hobbit_stats"] = hobbit_stats
         total_calls = sum(hobbit_stats.values())
         print(f"\n[HOBBIT Stats]")
         print(f"  FP16 hit:  {hobbit_stats['hit']:>6}")
         print(f"  FP16 miss: {hobbit_stats['miss']:>6}")
         print(f"  INT4:      {hobbit_stats['int4']:>6}")
         print(f"  Skip:      {hobbit_stats['skip']:>6}")
-        print(f"  INT4+Skip: {(hobbit_stats['int4']+hobbit_stats['skip'])/total_calls*100:.1f}%")
+        print(
+            f"  INT4+Skip: {(hobbit_stats['int4']+hobbit_stats['skip'])/total_calls*100:.1f}%"
+        )
 
-        # 保存结果
-        out_path = os.path.join(DATA_DIR, "..", "result",
-                                f"gsm8k_hobbit_{Q_START}-{Q_START+n_questions-1}.json")
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        with open(out_path, "w") as f:
-            json.dump({"mode": "hobbit", "accuracy": acc,
-                       "hobbit_stats": hobbit_stats, "results": results}, f, indent=2)
-        print(f"[GSM8K] Saved to {out_path}")
+    with open(final_out_log, "w") as f:
+        json.dump(save_data, f, indent=2)
+    print(f"[GSM8K] Saved to {final_out_log}")
 
-    else:  # compare
-        # ---- 对比：先后跑 baseline 和 HOBBIT ----
-        print(f"\n{'='*60}")
-        print("Phase 1: Baseline (full FP16)")
-        print(f"{'='*60}")
-        model, tokenizer = load_model()
-        device = model.device
-        t0 = time.time()
-        baseline_results = evaluate_gsm8k(model, tokenizer, questions, answers, device)
-        baseline_elapsed = time.time() - t0
-        baseline_acc = print_results(baseline_results, "BASELINE", baseline_elapsed)
+    # 2) 也保存一份到 result/（本地 pull 下来后参考）
+    os.makedirs(RESULT_DIR, exist_ok=True)
+    final_out_res = os.path.join(
+        RESULT_DIR, f"gsm8k_{mode}_{Q_START}-{Q_START+n_questions-1}.json"
+    )
+    with open(final_out_res, "w") as f:
+        json.dump(save_data, f, indent=2)
 
-        # 释放模型显存（如果是同一个进程，但 transformers 可能不会马上释放）
-        del model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        print(f"\n{'='*60}")
-        print("Phase 2: HOBBIT (mixed precision)")
-        print(f"{'='*60}")
-        model2, tokenizer2 = load_model()
-        device2 = model2.device
-        hobbit_stats = patch_hobbit(model2)
-        t0 = time.time()
-        hobbit_results = evaluate_gsm8k(model2, tokenizer2, questions, answers, device2)
-        hobbit_elapsed = time.time() - t0
-        hobbit_acc = print_results(hobbit_results, "HOBBIT", hobbit_elapsed)
-
-        # ---- 汇总对比 ----
-        print(f"\n{'='*60}")
-        print(f"GSM8K Comparison Summary")
-        print(f"{'='*60}")
-        print(f"{'Method':<20} {'Accuracy':>10} {'Time':>10}")
-        print(f"{'-'*42}")
-        print(f"{'Baseline (FP16)':<20} {baseline_acc:>9.1f}% {baseline_elapsed:>9.0f}s")
-        print(f"{'HOBBIT':<20} {hobbit_acc:>9.1f}% {hobbit_elapsed:>9.0f}s")
-        print(f"{'Difference':<20} {hobbit_acc - baseline_acc:>+9.1f}% {'':>9}")
-        print()
-
-        # HOBBIT 统计
-        total_calls = sum(hobbit_stats.values())
-        print(f"HOBBIT expert decisions ({total_calls} total calls):")
-        print(f"  FP16 hit:  {hobbit_stats['hit']:>6} ({hobbit_stats['hit']/total_calls*100:5.1f}%)")
-        print(f"  FP16 miss: {hobbit_stats['miss']:>6} ({hobbit_stats['miss']/total_calls*100:5.1f}%)")
-        print(f"  INT4:      {hobbit_stats['int4']:>6} ({hobbit_stats['int4']/total_calls*100:5.1f}%)")
-        print(f"  Skip:      {hobbit_stats['skip']:>6} ({hobbit_stats['skip']/total_calls*100:5.1f}%)")
-        print(f"  INT4+Skip: {(hobbit_stats['int4']+hobbit_stats['skip'])/total_calls*100:.1f}% of calls")
-
-        # 检查是否存在之前的结果，做扩展对比
-        prev_files = []
-        for fname in os.listdir(os.path.join(DATA_DIR, "..", "result")):
-            if fname.startswith("gsm8k_") and fname.endswith(".json"):
-                prev_files.append(fname)
-        if prev_files:
-            print(f"\nPrevious results found: {prev_files}")
-
-        # 保存对比结果
-        out_path = os.path.join(DATA_DIR, "..", "result",
-                                f"gsm8k_compare_{Q_START}-{Q_START+n_questions-1}.json")
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        with open(out_path, "w") as f:
-            json.dump({
-                "mode": "compare",
-                "n_questions": n_questions,
-                "baseline_accuracy": baseline_acc,
-                "hobbit_accuracy": hobbit_acc,
-                "accuracy_diff": hobbit_acc - baseline_acc,
-                "baseline_time": baseline_elapsed,
-                "hobbit_time": hobbit_elapsed,
-                "hobbit_stats": hobbit_stats,
-                "baseline_results": baseline_results,
-                "hobbit_results": hobbit_results,
-            }, f, indent=2)
-        print(f"[GSM8K] Saved to {out_path}")
+    # 清理 checkpoint（已完成，不再需要续跑）
+    if os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
+        print(f"[GSM8K] Checkpoint cleaned: {cp_name}")
 
     print(f"\n[GSM8K] DONE")
 
