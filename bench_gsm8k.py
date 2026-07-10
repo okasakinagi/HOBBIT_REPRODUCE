@@ -149,12 +149,13 @@ def quantize_weight_to_int4(weight):
     return dq_weight
 
 
+# 懒量化全局缓存：{id(experts_module)_eid: (int4_gate, int4_down)  on CPU}
+_LAZY_INT4_CACHE = {}
+
+
 @torch.no_grad()
 def make_hobbit_forward(stats, int4_gate_up, int4_down):
-    """HOBBIT 决策逻辑：实际执行 INT4 替换 + Skip。
-
-    int4_gate_up / int4_down: CPU 上的 INT4 量化权重 (num_experts, ...)
-    """
+    """HOBBIT 决策：INT4 替换 + Skip。支持预量化（GPU 层）和懒量化（meta 层）。"""
 
     def f(self, hidden_states):
         B, S, D = hidden_states.shape
@@ -183,22 +184,40 @@ def make_hobbit_forward(stats, int4_gate_up, int4_down):
                     stats["skip"] += 1
                     modified_w[t, i] = 0.0
 
-        # === INT4 替换：逐 expert 从 CPU 搬到 GPU，替换权重切片 ===
+        # === INT4 替换（预量化 or 懒量化，32 层全覆盖） ===
         if int4_experts:
-            orig_gate = {}
-            orig_down = {}
+            orig_bak = {}
             for eid in int4_experts:
-                orig_gate[eid] = self.experts.gate_up_proj.data[eid].clone()
-                orig_down[eid] = self.experts.down_proj.data[eid].clone()
-                self.experts.gate_up_proj.data[eid].copy_(int4_gate_up[eid].to(device))
-                self.experts.down_proj.data[eid].copy_(int4_down[eid].to(device))
+                # 取 INT4 权重：预量化（GPU 层）或懒量化（meta 层，forward 时 hook 已加载）
+                cache_key = (id(self.experts), eid)
+                if cache_key not in _LAZY_INT4_CACHE:
+                    need_lazy = (int4_gate_up is None or torch.isnan(int4_gate_up[eid]).any())
+                    if need_lazy:
+                        # Meta 层首次命中：hook 已将权重加载到 GPU，量化丢 CPU 缓存
+                        w_g = self.experts.gate_up_proj.data[eid]
+                        w_d = self.experts.down_proj.data[eid]
+                        _LAZY_INT4_CACHE[cache_key] = (
+                            quantize_weight_to_int4(w_g).cpu(),
+                            quantize_weight_to_int4(w_d).cpu(),
+                        )
+                    else:
+                        _LAZY_INT4_CACHE[cache_key] = (int4_gate_up[eid], int4_down[eid])
+                q_g, q_d = _LAZY_INT4_CACHE[cache_key]
+
+                # 备份原始 → CPU（clone 的 GPU 临时副本自动释放），替换为 INT4
+                orig_bak[eid] = (
+                    self.experts.gate_up_proj.data[eid].clone().cpu(),
+                    self.experts.down_proj.data[eid].clone().cpu(),
+                )
+                self.experts.gate_up_proj.data[eid].copy_(q_g.to(device))
+                self.experts.down_proj.data[eid].copy_(q_d.to(device))
 
         x = self.experts(x, top_k_index, modified_w)
 
         if int4_experts:
             for eid in int4_experts:
-                self.experts.gate_up_proj.data[eid].copy_(orig_gate[eid])
-                self.experts.down_proj.data[eid].copy_(orig_down[eid])
+                self.experts.gate_up_proj.data[eid].copy_(orig_bak[eid][0].to(device))
+                self.experts.down_proj.data[eid].copy_(orig_bak[eid][1].to(device))
 
         return x.reshape(B, S, D)
 
@@ -206,33 +225,44 @@ def make_hobbit_forward(stats, int4_gate_up, int4_down):
 
 
 def patch_hobbit(model):
-    """给模型缝上 HOBBIT：预计算 INT4 权重（放 CPU） + 替换 forward"""
+    """给模型缝上 HOBBIT：预计算 INT4 权重（GPU 层）+ meta 层懒量化"""
     sample_moe = model.model.layers[0].mlp
     n_experts = sample_moe.experts.gate_up_proj.shape[0]
     dtype = sample_moe.experts.gate_up_proj.dtype
     hidden_dim = sample_moe.experts.gate_up_proj.shape[-1]
     intermediate_dim = sample_moe.experts.down_proj.shape[-1]
 
-    print(f"[HOBBIT] Pre-computing INT4 weights for {n_experts} experts x {len(model.model.layers)} layers "
-          f"(CPU storage, GPU on-demand)...")
+    gpu_count, meta_count = 0, 0
+    print(f"[HOBBIT] Pre-computing INT4 for {n_experts} experts x {len(model.model.layers)} layers...")
 
     layer_stats = []
 
     for layer_idx, layer in enumerate(model.model.layers):
         experts = layer.mlp.experts
+        is_meta = experts.gate_up_proj.is_meta
 
-        # INT4 权重放 CPU，避免 GPU OOM
-        int4_gate_up = torch.empty(
-            n_experts, 2 * intermediate_dim, hidden_dim,
-            device="cpu", dtype=dtype
-        )
-        int4_down = torch.empty(
-            n_experts, hidden_dim, intermediate_dim,
-            device="cpu", dtype=dtype
-        )
-        for eid in range(n_experts):
-            int4_gate_up[eid] = quantize_weight_to_int4(experts.gate_up_proj.data[eid]).cpu()
-            int4_down[eid] = quantize_weight_to_int4(experts.down_proj.data[eid]).cpu()
+        if is_meta:
+            # Meta 层：不预量化，传 None，forward 时懒量化
+            int4_gate_up = None
+            int4_down = None
+            meta_count += 1
+        else:
+            # GPU 层：预计算 INT4 放 CPU
+            int4_gate_up = torch.empty(
+                n_experts, 2 * intermediate_dim, hidden_dim,
+                device="cpu", dtype=dtype
+            )
+            int4_down = torch.empty(
+                n_experts, hidden_dim, intermediate_dim,
+                device="cpu", dtype=dtype
+            )
+            for eid in range(n_experts):
+                int4_gate_up[eid] = quantize_weight_to_int4(experts.gate_up_proj.data[eid]).cpu()
+                int4_down[eid] = quantize_weight_to_int4(experts.down_proj.data[eid]).cpu()
+            gpu_count += 1
+
+        if (layer_idx + 1) % 8 == 0:
+            print(f"[HOBBIT]   Layer {layer_idx+1}/{len(model.model.layers)} processed")
 
         s = {"hit": 0, "miss": 0, "int4": 0, "skip": 0, "cache": {0, 1}}
         layer_stats.append(s)
@@ -240,7 +270,8 @@ def patch_hobbit(model):
             layer.mlp, type(layer.mlp)
         )
 
-    print(f"[HOBBIT] Patch complete — {len(model.model.layers)} layers")
+    print(f"[HOBBIT] Patch complete — {gpu_count} GPU layers pre-quantized, "
+          f"{meta_count} CPU-offloaded (lazy INT4 on first use)")
 
     class HobbitStats:
         def __init__(self, stats_list):
