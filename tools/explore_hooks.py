@@ -14,26 +14,40 @@ model = MixtralForCausalLM.from_pretrained(
     low_cpu_mem_usage=True, local_files_only=True,
 )
 
-for i in [0, 25, 26]:
+for i in [0, 25]:
     mlp = model.model.layers[i].mlp
-    experts = mlp.experts
     print(f"\nLayer {i} mlp:")
-    print(f"  gate_up_proj: device={experts.gate_up_proj.device}, is_meta={experts.gate_up_proj.is_meta}")
-
     if hasattr(mlp, "_hf_hook") and mlp._hf_hook is not None:
         h = mlp._hf_hook
         print(f"  _hf_hook: {type(h).__name__}")
-        for attr in ["execution_device", "offload_device"]:
-            if hasattr(h, attr):
-                print(f"    {attr}: {getattr(h, attr)}")
+        # 列出 hook 的所有非私有属性
+        for attr in dir(h):
+            if not attr.startswith("_"):
+                val = getattr(h, attr)
+                if isinstance(val, (int, str, torch.device)):
+                    print(f"    {attr}: {val}")
+                elif isinstance(val, dict):
+                    print(f"    {attr}: dict with {len(val)} keys")
+                    if len(val) > 0:
+                        sample_key = list(val.keys())[0]
+                        sample_val = val[sample_key]
+                        print(f"      sample key: {sample_key}")
+                        if hasattr(sample_val, 'shape'):
+                            print(f"      sample val: shape={sample_val.shape}, device={sample_val.device}")
+                        else:
+                            print(f"      sample val type: {type(sample_val).__name__}")
+                elif hasattr(val, 'shape'):
+                    print(f"    {attr}: tensor shape={val.shape}, device={val.device}")
+                elif val is not None:
+                    print(f"    {attr}: {type(val).__name__} = {str(val)[:80]}")
     else:
-        print(f"  _hf_hook: None or not found")
+        print(f"  _hf_hook: None")
 
-# === 关键实验：dummy forward 后 meta 层能否读取 ===
-print("\n\n=== Dummy forward through layer 25 mlp ===")
-dummy = torch.zeros(1, 1, model.config.hidden_size, device="cuda:0")
+# === 关键实验：通过 decoder layer 做 forward 后检查 meta 权重 ===
+print("\n\n=== Forward through decoder layer 25 (with correct dtype) ===")
+dummy = torch.zeros(1, 1, model.config.hidden_size, device="cuda:0", dtype=torch.bfloat16)
 with torch.no_grad():
-    _ = model.model.layers[25].mlp(dummy)
+    _ = model.model.layers[25](dummy)
 
 exp = model.model.layers[25].mlp.experts
 print(f"After forward: gate_up_proj: device={exp.gate_up_proj.device}, is_meta={exp.gate_up_proj.is_meta}")
@@ -41,5 +55,8 @@ if not exp.gate_up_proj.is_meta:
     w = exp.gate_up_proj.data[0]
     print(f"  weight[0] shape={w.shape}, dtype={w.dtype}, min={w.min().item():.2f}, max={w.max().item():.2f}")
 else:
-    print("  Still meta after forward!")
+    print("  Still meta after decoder_layer forward!")
+
+# 再试一次: 看 post-forward hook 后权重去哪了
+print(f"After forward: gate_up_proj device={exp.gate_up_proj.device}")
 
