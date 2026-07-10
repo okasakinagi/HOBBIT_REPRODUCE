@@ -78,7 +78,9 @@ g:\moe\
 │   ├── 4.1 llama.cpp基准 → 传输占86%                │
 │   ├── 4.2 MMLU精度 → 43.6%基线                     │
 │   ├── 4.3 HOBBIT吞吐量 → pp 177 t/s               │
-│   └── 4.4 真实混合精度 → cos 0.9998, 50%节省       │
+│   ├── 4.4 真实混合精度 → cos 0.9998, 50%节省       │
+│   ├── 4.5 GSM8K baseline → 35.0% (20题)           │
+│   └── 4.6 GSM8K HOBBIT (bnb NF4 + skip)           🔄
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -144,6 +146,20 @@ g:\moe\
 
 ---
 
+### 架构变更说明（2026-07-10）
+
+**bitsandbytes 确认可用**：`python -m bitsandbytes` 返回 SUCCESS，之前误以为不可用是因为 `BitsAndBytesConfig` 全模型量化导致 OOM/meta tensor 崩溃，但 bitsandbytes 库本身实际正常。现在 bench 脚本用 `bnb.functional.quantize_nf4()` 做逐专家量化。
+
+**INT4 替换策略：**
+- **GPU 层 (0-24):** patch 时预计算 NF4 量化权重，放 CPU
+- **Meta 层 (25-31):** forward 时 hooks 加载权重后做懒量化并缓存（首次 INT4 命中时量化）
+- **替换方式:** 逐 expert 切片 (~336MB) 搬上 GPU，算完恢复，显存安全可控
+- **Skip:** 路由权重清零，32 层一致生效
+
+**GSM8K 评测脚本：** 支持增量 checkpoint、断点续跑、真实 bitsandbytes INT4。
+
+---
+
 ## 四、细化目标与验收指标
 
 ### 阶段3：真实模型加载与 HOBBIT 推理（当前阶段）
@@ -201,6 +217,26 @@ bfloat16 + CPU offload（层 28-31 在 CPU），HOBBIT 决策逻辑开启：
 - 论文的核心验证点——"传输开销占 86%"——已由 llama.cpp 基线对实验证，不需要 HOBBIT 版达到全 GPU 速度
 
 #### 4.4 MMLU 精度（已完成，基线参考）
+
+| 学科 | 题数 | 准确率 |
+|------|------|--------|
+| high_school_physics | 151 | 42.4% |
+| high_school_mathematics | 231 | 40.5% |
+| professional_law | 184 | 48.0% |
+| **平均** | — | **43.6%** |
+
+> HOBBIT 模式下的 MMLU 评测暂未执行。bench_mmlu.py 的 `make_hobbit_forward` 仍是旧版"只计数"逻辑，需同步更新为真正的 INT4 替换 + skip 后才有意义。
+
+#### 4.5 GSM8K 精度评测（进行中）
+
+**脚本：** `bench_gsm8k.py`（支持 checkpoint + 断点续跑）
+
+| 模式 | 20题准确率 | 状态 |
+|------|-----------|------|
+| Baseline (FP16) | 35.0% (7/20) | ✅ 完成 |
+| HOBBIT (bnb NF4 + skip) | ? | 🔄 跑完中 |
+
+> 提取答案时遇到 `"18."` vs `"18"` 的小数点误判问题，已修复并提供了 `tools/re_eval_gsm8k.py` 重评工具。
 
 3 学科 551 题，0-shot，平均 43.6%。当前 HOBBIT 未替换 INT4 实际计算，准确率等同全精度基线。
 

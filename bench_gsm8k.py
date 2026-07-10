@@ -127,6 +127,7 @@ def quantize_weight_to_int4(weight):
     # 尝试 bitsandbytes 真实量化
     try:
         import bitsandbytes as bnb
+
         # quantize_4bit: 量化到 4-bit (NF4 格式)，再反量化回 float
         q_data, q_state = bnb.functional.quantize_nf4(weight)
         dq_weight = bnb.functional.dequantize_nf4(q_data, q_state)
@@ -173,8 +174,9 @@ def make_hobbit_forward(stats, int4_gate_up, int4_down):
             cum = 0.0
             for i in range(len(idx_cpu[t])):
                 eid = int(idx_cpu[t][i])
+                if i > 0:
+                    cum += w_cpu[t][i - 1]
                 score = 0.0 if i == 0 else cum / tw
-                cum += w_cpu[t][i - 1] if i > 0 else 0
                 if score <= HOBBIT_CONFIG["T1"]:
                     stats["hit" if eid in stats["cache"] else "miss"] += 1
                 elif score <= HOBBIT_CONFIG["T2"]:
@@ -191,7 +193,9 @@ def make_hobbit_forward(stats, int4_gate_up, int4_down):
                 # 取 INT4 权重：预量化（GPU 层）或懒量化（meta 层，forward 时 hook 已加载）
                 cache_key = (id(self.experts), eid)
                 if cache_key not in _LAZY_INT4_CACHE:
-                    need_lazy = (int4_gate_up is None or torch.isnan(int4_gate_up[eid]).any())
+                    need_lazy = (
+                        int4_gate_up is None or torch.isnan(int4_gate_up[eid]).any()
+                    )
                     if need_lazy:
                         # Meta 层首次命中：hook 已将权重加载到 GPU，量化丢 CPU 缓存
                         w_g = self.experts.gate_up_proj.data[eid]
@@ -201,7 +205,10 @@ def make_hobbit_forward(stats, int4_gate_up, int4_down):
                             quantize_weight_to_int4(w_d).cpu(),
                         )
                     else:
-                        _LAZY_INT4_CACHE[cache_key] = (int4_gate_up[eid], int4_down[eid])
+                        _LAZY_INT4_CACHE[cache_key] = (
+                            int4_gate_up[eid],
+                            int4_down[eid],
+                        )
                 q_g, q_d = _LAZY_INT4_CACHE[cache_key]
 
                 # 备份原始 → CPU（clone 的 GPU 临时副本自动释放），替换为 INT4
@@ -233,7 +240,9 @@ def patch_hobbit(model):
     intermediate_dim = sample_moe.experts.down_proj.shape[-1]
 
     gpu_count, meta_count = 0, 0
-    print(f"[HOBBIT] Pre-computing INT4 for {n_experts} experts x {len(model.model.layers)} layers...")
+    print(
+        f"[HOBBIT] Pre-computing INT4 for {n_experts} experts x {len(model.model.layers)} layers..."
+    )
 
     layer_stats = []
 
@@ -249,16 +258,18 @@ def patch_hobbit(model):
         else:
             # GPU 层：预计算 INT4 放 CPU
             int4_gate_up = torch.empty(
-                n_experts, 2 * intermediate_dim, hidden_dim,
-                device="cpu", dtype=dtype
+                n_experts, 2 * intermediate_dim, hidden_dim, device="cpu", dtype=dtype
             )
             int4_down = torch.empty(
-                n_experts, hidden_dim, intermediate_dim,
-                device="cpu", dtype=dtype
+                n_experts, hidden_dim, intermediate_dim, device="cpu", dtype=dtype
             )
             for eid in range(n_experts):
-                int4_gate_up[eid] = quantize_weight_to_int4(experts.gate_up_proj.data[eid]).cpu()
-                int4_down[eid] = quantize_weight_to_int4(experts.down_proj.data[eid]).cpu()
+                int4_gate_up[eid] = quantize_weight_to_int4(
+                    experts.gate_up_proj.data[eid]
+                ).cpu()
+                int4_down[eid] = quantize_weight_to_int4(
+                    experts.down_proj.data[eid]
+                ).cpu()
             gpu_count += 1
 
         if (layer_idx + 1) % 8 == 0:
@@ -270,8 +281,10 @@ def patch_hobbit(model):
             layer.mlp, type(layer.mlp)
         )
 
-    print(f"[HOBBIT] Patch complete — {gpu_count} GPU layers pre-quantized, "
-          f"{meta_count} CPU-offloaded (lazy INT4 on first use)")
+    print(
+        f"[HOBBIT] Patch complete — {gpu_count} GPU layers pre-quantized, "
+        f"{meta_count} CPU-offloaded (lazy INT4 on first use)"
+    )
 
     class HobbitStats:
         def __init__(self, stats_list):
@@ -282,7 +295,7 @@ def patch_hobbit(model):
             return {k: v for k, v in total.items() if k != "cache"}
 
         def aggregate(self):
-            total = {"hit": 0, "miss": 0, "int4": 0, "skip": 0, "cache": {0, 1}}
+            total = {"hit": 0, "miss": 0, "int4": 0, "skip": 0}
             for s in self._list:
                 for k in ("hit", "miss", "int4", "skip"):
                     total[k] += s[k]

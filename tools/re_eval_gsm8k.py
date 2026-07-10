@@ -60,11 +60,13 @@ def main():
         new_pred = extract_answer_fixed(generated)
         r["prediction"] = new_pred
         old_correct = r["correct"]
-        r["correct"] = (new_pred == r["ground_truth"])
+        r["correct"] = new_pred == r["ground_truth"]
         if old_correct != r["correct"]:
             corrected += 1
-            print(f"  #{r['idx']}: '{old_pred}' -> '{new_pred}' (GT={r['ground_truth']}) "
-                  f"{'FIXED' if r['correct'] else 'STILL WRONG'}")
+            print(
+                f"  #{r['idx']}: '{old_pred}' -> '{new_pred}' (GT={r['ground_truth']}) "
+                f"{'FIXED' if r['correct'] else 'STILL WRONG'}"
+            )
 
     correct = sum(r["correct"] for r in results)
     total = len(results)
