@@ -43,20 +43,36 @@ for i in [0, 25]:
     else:
         print(f"  _hf_hook: None")
 
-# === 关键实验：通过 decoder layer 做 forward 后检查 meta 权重 ===
-print("\n\n=== Forward through decoder layer 25 (with correct dtype) ===")
-dummy = torch.zeros(1, 1, model.config.hidden_size, device="cuda:0", dtype=torch.bfloat16)
-with torch.no_grad():
-    _ = model.model.layers[25](dummy)
+# === 直接读 safetensors 文件 ===
+print("\n\n=== Read expert weights from safetensors ===")
+model_path = os.path.expanduser("~/models/mixtral-8x7b")
+import glob
 
-exp = model.model.layers[25].mlp.experts
-print(f"After forward: gate_up_proj: device={exp.gate_up_proj.device}, is_meta={exp.gate_up_proj.is_meta}")
-if not exp.gate_up_proj.is_meta:
-    w = exp.gate_up_proj.data[0]
-    print(f"  weight[0] shape={w.shape}, dtype={w.dtype}, min={w.min().item():.2f}, max={w.max().item():.2f}")
-else:
-    print("  Still meta after decoder_layer forward!")
+# 找 tensor 名
+layer25_param_names = [n for n, p in model.model.layers[25].mlp.experts.named_parameters()]
+print(f"Layer 25 experts param names: {layer25_param_names}")
 
-# 再试一次: 看 post-forward hook 后权重去哪了
-print(f"After forward: gate_up_proj device={exp.gate_up_proj.device}")
+# 找 safetensors 文件
+sf_files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
+print(f"Safetensors files: {[os.path.basename(f) for f in sf_files]}")
+
+# 在 safetensors 中搜索对应的 tensor name
+from safetensors import safe_open
+target_names = [
+    "model.layers.25.mlp.experts.gate_up_proj",
+    "model.layers.25.mlp.experts.down_proj",
+]
+for sf_path in sf_files:
+    fname = os.path.basename(sf_path)
+    try:
+        with safe_open(sf_path, framework="pt", device="cpu") as f:
+            keys = f.keys()
+            for t in target_names:
+                if t in keys:
+                    tensor = f.get_tensor(t)
+                    print(f"  FOUND in {fname}: {t}: shape={tensor.shape}, dtype={tensor.dtype}, "
+                          f"min={tensor.min().item():.2f}, max={tensor.max().item():.2f}, "
+                          f"device={tensor.device}, is_meta={tensor.is_meta}")
+    except Exception as e:
+        print(f"  Error reading {fname}: {e}")
 
