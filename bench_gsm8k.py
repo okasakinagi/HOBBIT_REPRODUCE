@@ -46,6 +46,7 @@ if not os.environ.get("HF_ENDPOINT"):
     os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 import torch
+import torch.nn as nn
 from transformers import MixtralForCausalLM, AutoTokenizer
 
 # ============================================================
@@ -144,8 +145,6 @@ def quantize_weight_to_int4(weight):
         return weight.clone()
     zero_point = -min_val / scale
     q_weight = torch.clamp(torch.round(weight / scale + zero_point), qmin, qmax)
-    dq_weight = (q_weight - zero_point) * scale
-    return dq_weight
     dq_weight = (q_weight - zero_point) * scale
     return dq_weight
 
