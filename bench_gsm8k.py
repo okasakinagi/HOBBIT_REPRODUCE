@@ -249,14 +249,14 @@ def _load_meta_weights(model):
             2 * intermediate_dim,
             hidden_dim,
             device="cpu",
-            dtype=experts.gate_up_proj.dtype,
+            dtype=torch.bfloat16,  # 与 safetensors 文件一致
         )
         down = torch.zeros(
             n_exp,
             hidden_dim,
             intermediate_dim,
             device="cpu",
-            dtype=experts.down_proj.dtype,
+            dtype=torch.bfloat16,
         )
 
         # 扫描所有 shard，加载该层所有 expert 的 w1, w2, w3
@@ -269,17 +269,18 @@ def _load_meta_weights(model):
                     w2_key = f"{prefix}.w2.weight"
                     w3_key = f"{prefix}.w3.weight"
                     if w1_key in keys and w3_key in keys:
-                        w1 = f.get_tensor(w1_key)  # (intermediate, hidden)
+                        w1 = f.get_tensor(w1_key)  # (intermediate, hidden), bfloat16
                         w3 = f.get_tensor(w3_key)
-                        gate_up[eid] = torch.cat([w1, w3], dim=0).to(
-                            dtype=experts.gate_up_proj.dtype
-                        )
+                        gate_up[eid] = torch.cat([w1, w3], dim=0)
                     if w2_key in keys:
-                        down[eid] = f.get_tensor(w2_key).to(
-                            dtype=experts.down_proj.dtype
-                        )
+                        down[eid] = f.get_tensor(w2_key)
 
-        # 替换 meta tensor 的数据（保持 Parameter 对象不变，加速 hooks 才能正确识别）
+        # 直接用 bfloat16 数据替换 meta tensor。需匹配 meta param 的 dtype 才能通过 set_data 检查。
+        meta_dtype = experts.gate_up_proj.dtype
+        if meta_dtype != gate_up.dtype:
+            print(f"[LOAD_META]   Layer {idx}: converting {gate_up.dtype} -> {meta_dtype}")
+            gate_up = gate_up.to(dtype=meta_dtype)
+            down = down.to(dtype=meta_dtype)
         experts.gate_up_proj.data = gate_up
         experts.down_proj.data = down
         print(
