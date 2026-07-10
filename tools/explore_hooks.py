@@ -19,42 +19,27 @@ for i in [0, 25, 26]:
     experts = mlp.experts
     print(f"\nLayer {i} mlp:")
     print(f"  gate_up_proj: device={experts.gate_up_proj.device}, is_meta={experts.gate_up_proj.is_meta}")
-    print(f"  down_proj:    device={experts.down_proj.device}, is_meta={experts.down_proj.is_meta}")
 
-    # 查找所有 hook 相关属性
-    hook_attrs = [a for a in dir(mlp) if "hook" in a.lower()]
-    print(f"  hook attrs: {hook_attrs}")
-
-    # 检查 _hf_hook
-    if hasattr(mlp, "_hf_hook"):
+    if hasattr(mlp, "_hf_hook") and mlp._hf_hook is not None:
         h = mlp._hf_hook
         print(f"  _hf_hook: {type(h).__name__}")
-        if h is not None:
-            print(f"    execution_device: {h.execution_device}")
-            print(f"    offload_device: {h.offload_device}")
+        for attr in ["execution_device", "offload_device"]:
+            if hasattr(h, attr):
+                print(f"    {attr}: {getattr(h, attr)}")
     else:
-        print(f"  _hf_hook: not found")
+        print(f"  _hf_hook: None or not found")
 
-    # 检查是否有 hooks dict
-    for attr_name in ["_forward_hooks", "_forward_pre_hooks", "_backward_hooks", "_modules"]:
-        if hasattr(mlp, attr_name):
-            hooks = getattr(mlp, attr_name)
-            print(f"  {attr_name}: {len(hooks)} entries" if isinstance(hooks, dict) else f"  {attr_name}: present")
-
-# 对 meta 层：做一次 forward 后检查权重状态
-print("\n\nAfter dummy forward on layer 25:")
+# === 关键实验：dummy forward 后 meta 层能否读取 ===
+print("\n\n=== Dummy forward through layer 25 mlp ===")
 dummy = torch.zeros(1, 1, model.config.hidden_size, device="cuda:0")
 with torch.no_grad():
-    out = model.model.layers[25].mlp(dummy)
+    _ = model.model.layers[25].mlp(dummy)
 
-experts = model.model.layers[25].mlp.experts
-print(f"  gate_up_proj: device={experts.gate_up_proj.device}, is_meta={experts.gate_up_proj.is_meta}")
-print(f"  data[0] device: {experts.gate_up_proj.data[0].device}")
-print(f"  data[0] is_meta: {experts.gate_up_proj.data[0].is_meta}")
-
-# 再试一次读取权重
-if not experts.gate_up_proj.is_meta:
-    w = experts.gate_up_proj.data[0]
-    print(f"  weight[0] shape: {w.shape}, dtype: {w.dtype}, min: {w.min().item():.4f}")
+exp = model.model.layers[25].mlp.experts
+print(f"After forward: gate_up_proj: device={exp.gate_up_proj.device}, is_meta={exp.gate_up_proj.is_meta}")
+if not exp.gate_up_proj.is_meta:
+    w = exp.gate_up_proj.data[0]
+    print(f"  weight[0] shape={w.shape}, dtype={w.dtype}, min={w.min().item():.2f}, max={w.max().item():.2f}")
 else:
-    print("  Still meta!")
+    print("  Still meta after forward!")
+
