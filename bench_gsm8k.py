@@ -46,6 +46,7 @@ if not os.environ.get("HF_ENDPOINT"):
     os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 import torch
+import torch.nn as nn
 from transformers import MixtralForCausalLM, AutoTokenizer
 
 # ============================================================
@@ -275,14 +276,9 @@ def _load_meta_weights(model):
                     if w2_key in keys:
                         down[eid] = f.get_tensor(w2_key)
 
-        # 直接用 bfloat16 数据替换 meta tensor。需匹配 meta param 的 dtype 才能通过 set_data 检查。
-        meta_dtype = experts.gate_up_proj.dtype
-        if meta_dtype != gate_up.dtype:
-            print(f"[LOAD_META]   Layer {idx}: converting {gate_up.dtype} -> {meta_dtype}")
-            gate_up = gate_up.to(dtype=meta_dtype)
-            down = down.to(dtype=meta_dtype)
-        experts.gate_up_proj.data = gate_up
-        experts.down_proj.data = down
+        # 替换 meta tensor 为真实 cpu 权重（直接操作 _parameters 字典绕过 set_data 设备检查）
+        experts._parameters["gate_up_proj"] = nn.Parameter(gate_up)
+        experts._parameters["down_proj"] = nn.Parameter(down)
         print(
             f"[LOAD_META]   Layer {idx}: {n_exp} experts loaded ({gate_up.shape}, {down.shape})"
         )
