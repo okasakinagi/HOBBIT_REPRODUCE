@@ -153,8 +153,7 @@ def quantize_weight_to_int4(weight):
 def make_hobbit_forward(stats, int4_gate_up, int4_down):
     """HOBBIT 决策逻辑：实际执行 INT4 替换 + Skip。
 
-    int4_gate_up: 预量化的 gate_up_proj (num_experts, 2*intermediate, hidden)
-    int4_down:    预量化的 down_proj (num_experts, hidden, intermediate)
+    int4_gate_up / int4_down: CPU 上的 INT4 量化权重 (num_experts, ...)
     """
 
     def f(self, hidden_states):
@@ -164,9 +163,9 @@ def make_hobbit_forward(stats, int4_gate_up, int4_down):
         idx_cpu = top_k_index.cpu().numpy()
         w_cpu = top_k_weights.cpu().numpy()
 
-        # 记录哪些专家需要 INT4 替换
         int4_experts = set()
         modified_w = top_k_weights.clone()
+        device = x.device
 
         for t in range(B * S):
             tw = w_cpu[t].sum()
@@ -182,17 +181,17 @@ def make_hobbit_forward(stats, int4_gate_up, int4_down):
                     int4_experts.add(eid)
                 else:
                     stats["skip"] += 1
-                    modified_w[t, i] = 0.0  # ← 实际跳过：权重清零
+                    modified_w[t, i] = 0.0
 
-        # === 实际 INT4 替换：替换权重切片，算完恢复 ===
+        # === INT4 替换：逐 expert 从 CPU 搬到 GPU，替换权重切片 ===
         if int4_experts:
             orig_gate = {}
             orig_down = {}
             for eid in int4_experts:
                 orig_gate[eid] = self.experts.gate_up_proj.data[eid].clone()
                 orig_down[eid] = self.experts.down_proj.data[eid].clone()
-                self.experts.gate_up_proj.data[eid].copy_(int4_gate_up[eid])
-                self.experts.down_proj.data[eid].copy_(int4_down[eid])
+                self.experts.gate_up_proj.data[eid].copy_(int4_gate_up[eid].to(device))
+                self.experts.down_proj.data[eid].copy_(int4_down[eid].to(device))
 
         x = self.experts(x, top_k_index, modified_w)
 
@@ -207,22 +206,33 @@ def make_hobbit_forward(stats, int4_gate_up, int4_down):
 
 
 def patch_hobbit(model):
-    """给模型缝上 HOBBIT：预计算 INT4 权重 + 替换 forward"""
+    """给模型缝上 HOBBIT：预计算 INT4 权重（放 CPU） + 替换 forward"""
     sample_moe = model.model.layers[0].mlp
     n_experts = sample_moe.experts.gate_up_proj.shape[0]
-    print(f"[HOBBIT] Pre-computing INT4 weights for {n_experts} experts x {len(model.model.layers)} layers...")
+    dtype = sample_moe.experts.gate_up_proj.dtype
+    hidden_dim = sample_moe.experts.gate_up_proj.shape[-1]
+    intermediate_dim = sample_moe.experts.down_proj.shape[-1]
 
-    layer_stats = []  # 收集每层的 stat dict 引用，forward 后聚合
+    print(f"[HOBBIT] Pre-computing INT4 weights for {n_experts} experts x {len(model.model.layers)} layers "
+          f"(CPU storage, GPU on-demand)...")
+
+    layer_stats = []
 
     for layer_idx, layer in enumerate(model.model.layers):
-        moe = layer.mlp
-        experts = moe.experts
-        # 预计算本层所有专家的 INT4 权重
-        int4_gate_up = torch.empty_like(experts.gate_up_proj.data)
-        int4_down = torch.empty_like(experts.down_proj.data)
+        experts = layer.mlp.experts
+
+        # INT4 权重放 CPU，避免 GPU OOM
+        int4_gate_up = torch.empty(
+            n_experts, 2 * intermediate_dim, hidden_dim,
+            device="cpu", dtype=dtype
+        )
+        int4_down = torch.empty(
+            n_experts, hidden_dim, intermediate_dim,
+            device="cpu", dtype=dtype
+        )
         for eid in range(n_experts):
-            int4_gate_up[eid] = quantize_weight_to_int4(experts.gate_up_proj.data[eid])
-            int4_down[eid] = quantize_weight_to_int4(experts.down_proj.data[eid])
+            int4_gate_up[eid] = quantize_weight_to_int4(experts.gate_up_proj.data[eid]).cpu()
+            int4_down[eid] = quantize_weight_to_int4(experts.down_proj.data[eid]).cpu()
 
         s = {"hit": 0, "miss": 0, "int4": 0, "skip": 0, "cache": {0, 1}}
         layer_stats.append(s)
@@ -232,15 +242,12 @@ def patch_hobbit(model):
 
     print(f"[HOBBIT] Patch complete — {len(model.model.layers)} layers")
 
-    # 返回可聚合的 stats 代理对象
     class HobbitStats:
         def __init__(self, stats_list):
             self._list = stats_list
 
         def values(self):
-            """兼容 sum(hobbit_stats.values()) 调用"""
             total = self.aggregate()
-            # 排除 cache 键
             return {k: v for k, v in total.items() if k != "cache"}
 
         def aggregate(self):
