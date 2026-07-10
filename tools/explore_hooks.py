@@ -56,23 +56,23 @@ print(f"Layer 25 experts param names: {layer25_param_names}")
 sf_files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
 print(f"Safetensors files: {[os.path.basename(f) for f in sf_files]}")
 
-# 在 safetensors 中搜索对应的 tensor name
+# 直接在 safetensors 中搜索包含 layer 25 的 key
 from safetensors import safe_open
-target_names = [
-    "model.layers.25.mlp.experts.gate_up_proj",
-    "model.layers.25.mlp.experts.down_proj",
-]
+print("Searching for layer 25 tensors in safetensors files...")
 for sf_path in sf_files:
     fname = os.path.basename(sf_path)
-    try:
-        with safe_open(sf_path, framework="pt", device="cpu") as f:
-            keys = f.keys()
-            for t in target_names:
-                if t in keys:
-                    tensor = f.get_tensor(t)
-                    print(f"  FOUND in {fname}: {t}: shape={tensor.shape}, dtype={tensor.dtype}, "
-                          f"min={tensor.min().item():.2f}, max={tensor.max().item():.2f}, "
-                          f"device={tensor.device}, is_meta={tensor.is_meta}")
-    except Exception as e:
-        print(f"  Error reading {fname}: {e}")
+    with safe_open(sf_path, framework="pt", device="cpu") as f:
+        keys = list(f.keys())
+        layer25_keys = [k for k in keys if "layers.25" in k]
+        if layer25_keys:
+            print(f"\n  {fname} contains layer 25:")
+            for k in layer25_keys:
+                tensor = f.get_tensor(k)
+                print(f"    {k}: shape={tensor.shape}, dtype={tensor.dtype}")
+        # 只看第一个文件的部分 key 了解命名
+        if fname == sf_files[0]:
+            print(f"\n  {fname} sample keys (first 5):")
+            for k in keys[:5]:
+                t = f.get_tensor(k)
+                print(f"    {k}: shape={t.shape}")
 
