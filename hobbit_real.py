@@ -57,31 +57,34 @@ class HobbitRealLayer:
         def hobbit_forward(hidden_states):
             B, S, D = hidden_states.shape
             x = hidden_states.view(-1, D)
-            
+
             # 1. 路由
             _, top_k_weights, top_k_index = moe.gate(x)
-            
+
             # 2. HOBBIT 决策 + 修改路由权重
             modified_w = top_k_weights.clone()
             idx_cpu = top_k_index.cpu().numpy()
             w_cpu = top_k_weights.cpu().numpy()
-            
+
             for t in range(B * S):
-                tw = w_cpu[t].sum(); cum = 0.0
+                tw = w_cpu[t].sum()
+                cum = 0.0
                 for i in range(len(w_cpu[t])):
                     eid = int(idx_cpu[t][i])
                     if i > 0:
                         cum += w_cpu[t][i - 1]
                     score = 0.0 if i == 0 else cum / tw
-                    
+
                     if score <= T1:
                         stats["hit" if eid in cache else "miss"] += 1
                     elif score <= T2:
-                        stats["int4"] += 1; saved[0] += 3.0
+                        stats["int4"] += 1
+                        saved[0] += 3.0
                     else:
-                        stats["skip"] += 1; saved[0] += 4.0
+                        stats["skip"] += 1
+                        saved[0] += 4.0
                         modified_w[t, i] = 0.0  # 权重清零 = 跳过
-            
+
             # 3. 用修改后的权重调原生 experts
             return moe.experts(x, top_k_index, modified_w).reshape(B, S, D)
 

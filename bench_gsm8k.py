@@ -115,8 +115,47 @@ def load_model():
     return model, tokenizer
 
 
-def make_hobbit_forward(stats):
-    """HOBBIT 决策逻辑（与 bench_mmlu.py 一致）"""
+def quantize_weight_to_int4(weight):
+    """将权重量化到 INT4 再反量化，返回带量化误差的 float 权重。
+
+    优先用 bitsandbytes（真实 4-bit NF4 量化），
+    不可用时用 PyTorch fake quantization 模拟。
+    """
+    if weight.numel() == 0:
+        return weight.clone()
+
+    # 尝试 bitsandbytes 真实量化
+    try:
+        import bitsandbytes as bnb
+        # quantize_4bit: 量化到 4-bit (NF4 格式)，再反量化回 float
+        q_data, q_state = bnb.functional.quantize_nf4(weight)
+        dq_weight = bnb.functional.dequantize_nf4(q_data, q_state)
+        return dq_weight.to(dtype=weight.dtype)
+    except Exception:
+        pass
+
+    # Fallback: 手动 fake quantization
+    min_val = weight.min()
+    max_val = weight.max()
+    qmin, qmax = 0, 15  # 4-bit: 0~15
+    scale = (max_val - min_val) / (qmax - qmin)
+    if scale < 1e-12:
+        return weight.clone()
+    zero_point = -min_val / scale
+    q_weight = torch.clamp(torch.round(weight / scale + zero_point), qmin, qmax)
+    dq_weight = (q_weight - zero_point) * scale
+    return dq_weight
+    dq_weight = (q_weight - zero_point) * scale
+    return dq_weight
+
+
+@torch.no_grad()
+def make_hobbit_forward(stats, int4_gate_up, int4_down):
+    """HOBBIT 决策逻辑：实际执行 INT4 替换 + Skip。
+
+    int4_gate_up: 预量化的 gate_up_proj (num_experts, 2*intermediate, hidden)
+    int4_down:    预量化的 down_proj (num_experts, hidden, intermediate)
+    """
 
     def f(self, hidden_states):
         B, S, D = hidden_states.shape
@@ -124,6 +163,11 @@ def make_hobbit_forward(stats):
         _, top_k_weights, top_k_index = self.gate(x)
         idx_cpu = top_k_index.cpu().numpy()
         w_cpu = top_k_weights.cpu().numpy()
+
+        # 记录哪些专家需要 INT4 替换
+        int4_experts = set()
+        modified_w = top_k_weights.clone()
+
         for t in range(B * S):
             tw = w_cpu[t].sum()
             cum = 0.0
@@ -135,21 +179,84 @@ def make_hobbit_forward(stats):
                     stats["hit" if eid in stats["cache"] else "miss"] += 1
                 elif score <= HOBBIT_CONFIG["T2"]:
                     stats["int4"] += 1
+                    int4_experts.add(eid)
                 else:
                     stats["skip"] += 1
-        x = self.experts(x, top_k_index, top_k_weights)
+                    modified_w[t, i] = 0.0  # ← 实际跳过：权重清零
+
+        # === 实际 INT4 替换：替换权重切片，算完恢复 ===
+        if int4_experts:
+            orig_gate = {}
+            orig_down = {}
+            for eid in int4_experts:
+                orig_gate[eid] = self.experts.gate_up_proj.data[eid].clone()
+                orig_down[eid] = self.experts.down_proj.data[eid].clone()
+                self.experts.gate_up_proj.data[eid].copy_(int4_gate_up[eid])
+                self.experts.down_proj.data[eid].copy_(int4_down[eid])
+
+        x = self.experts(x, top_k_index, modified_w)
+
+        if int4_experts:
+            for eid in int4_experts:
+                self.experts.gate_up_proj.data[eid].copy_(orig_gate[eid])
+                self.experts.down_proj.data[eid].copy_(orig_down[eid])
+
         return x.reshape(B, S, D)
 
     return f
 
 
 def patch_hobbit(model):
-    """给模型缝上 HOBBIT"""
-    hobbit_stats = {"hit": 0, "miss": 0, "int4": 0, "skip": 0, "cache": {0, 1}}
-    for layer in model.model.layers:
+    """给模型缝上 HOBBIT：预计算 INT4 权重 + 替换 forward"""
+    sample_moe = model.model.layers[0].mlp
+    n_experts = sample_moe.experts.gate_up_proj.shape[0]
+    print(f"[HOBBIT] Pre-computing INT4 weights for {n_experts} experts x {len(model.model.layers)} layers...")
+
+    layer_stats = []  # 收集每层的 stat dict 引用，forward 后聚合
+
+    for layer_idx, layer in enumerate(model.model.layers):
+        moe = layer.mlp
+        experts = moe.experts
+        # 预计算本层所有专家的 INT4 权重
+        int4_gate_up = torch.empty_like(experts.gate_up_proj.data)
+        int4_down = torch.empty_like(experts.down_proj.data)
+        for eid in range(n_experts):
+            int4_gate_up[eid] = quantize_weight_to_int4(experts.gate_up_proj.data[eid])
+            int4_down[eid] = quantize_weight_to_int4(experts.down_proj.data[eid])
+
         s = {"hit": 0, "miss": 0, "int4": 0, "skip": 0, "cache": {0, 1}}
-        layer.mlp.forward = make_hobbit_forward(s).__get__(layer.mlp, type(layer.mlp))
-    return hobbit_stats
+        layer_stats.append(s)
+        layer.mlp.forward = make_hobbit_forward(s, int4_gate_up, int4_down).__get__(
+            layer.mlp, type(layer.mlp)
+        )
+
+    print(f"[HOBBIT] Patch complete — {len(model.model.layers)} layers")
+
+    # 返回可聚合的 stats 代理对象
+    class HobbitStats:
+        def __init__(self, stats_list):
+            self._list = stats_list
+
+        def values(self):
+            """兼容 sum(hobbit_stats.values()) 调用"""
+            total = self.aggregate()
+            # 排除 cache 键
+            return {k: v for k, v in total.items() if k != "cache"}
+
+        def aggregate(self):
+            total = {"hit": 0, "miss": 0, "int4": 0, "skip": 0, "cache": {0, 1}}
+            for s in self._list:
+                for k in ("hit", "miss", "int4", "skip"):
+                    total[k] += s[k]
+            return total
+
+        def __getitem__(self, key):
+            return self.aggregate()[key]
+
+        def __contains__(self, key):
+            return key in self.aggregate()
+
+    return HobbitStats(layer_stats)
 
 
 def extract_answer(text):
@@ -157,15 +264,25 @@ def extract_answer(text):
     # 优先找 "####" 后的数字
     m = re.search(r"####\s*(-?\d+\.?\d*)", text)
     if m:
-        return m.group(1).strip()
+        ans = m.group(1).strip()
+        # 去掉末尾小数点，如 "18." -> "18"
+        if ans.endswith("."):
+            ans = ans[:-1]
+        return ans
     # 备选：找 "answer is" 后的数字
     m = re.search(r"[Aa]nswer\s+is\s*(-?\d+\.?\d*)", text)
     if m:
-        return m.group(1).strip()
+        ans = m.group(1).strip()
+        if ans.endswith("."):
+            ans = ans[:-1]
+        return ans
     # 备选：找最后出现的数字
     nums = re.findall(r"-?\d+\.?\d*", text)
     if nums:
-        return nums[-1].strip()
+        ans = nums[-1].strip()
+        if ans.endswith("."):
+            ans = ans[:-1]
+        return ans
     return ""
 
 
@@ -361,16 +478,16 @@ def main():
         "results": results,
     }
     if hobbit_stats:
-        save_data["hobbit_stats"] = hobbit_stats
-        total_calls = sum(hobbit_stats.values())
+        agg = hobbit_stats.aggregate()
+        save_data["hobbit_stats"] = agg
+        stat_keys = [k for k in agg if k != "cache"]
+        total_calls = sum(agg[k] for k in stat_keys)
         print(f"\n[HOBBIT Stats]")
-        print(f"  FP16 hit:  {hobbit_stats['hit']:>6}")
-        print(f"  FP16 miss: {hobbit_stats['miss']:>6}")
-        print(f"  INT4:      {hobbit_stats['int4']:>6}")
-        print(f"  Skip:      {hobbit_stats['skip']:>6}")
-        print(
-            f"  INT4+Skip: {(hobbit_stats['int4']+hobbit_stats['skip'])/total_calls*100:.1f}%"
-        )
+        print(f"  FP16 hit:  {agg['hit']:>6} ({agg['hit']/total_calls*100:5.1f}%)")
+        print(f"  FP16 miss: {agg['miss']:>6} ({agg['miss']/total_calls*100:5.1f}%)")
+        print(f"  INT4:      {agg['int4']:>6} ({agg['int4']/total_calls*100:5.1f}%)")
+        print(f"  Skip:      {agg['skip']:>6} ({agg['skip']/total_calls*100:5.1f}%)")
+        print(f"  INT4+Skip: {(agg['int4']+agg['skip'])/total_calls*100:.1f}% of calls")
 
     with open(final_out_log, "w") as f:
         json.dump(save_data, f, indent=2)
