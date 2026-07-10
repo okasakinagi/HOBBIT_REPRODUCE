@@ -39,7 +39,7 @@ bench_gsm8k.py — GSM8K 数学推理精度评测
     - 最终汇总也会保存一份到 result/（本地参考用）
 """
 
-import sys, os, re, json, time, argparse
+import sys, os, re, json, time, argparse, glob
 
 os.environ["HF_HUB_ENABLE_HF_XET"] = "0"
 if not os.environ.get("HF_ENDPOINT"):
@@ -150,10 +150,6 @@ def quantize_weight_to_int4(weight):
     return dq_weight
 
 
-# 懒量化全局缓存：{id(experts_module)_eid: (int4_gate, int4_down)  on CPU}
-_LAZY_INT4_CACHE = {}
-
-
 @torch.no_grad()
 def make_hobbit_forward(stats, int4_gate_up, int4_down):
     """HOBBIT 决策：INT4 替换 + Skip。支持预量化（GPU 层）和懒量化（meta 层）。"""
@@ -186,32 +182,13 @@ def make_hobbit_forward(stats, int4_gate_up, int4_down):
                     stats["skip"] += 1
                     modified_w[t, i] = 0.0
 
-        # === INT4 替换（预量化 or 懒量化，32 层全覆盖） ===
+        # === INT4 替换（32 层全覆盖，均已预量化） ===
         if int4_experts:
             orig_bak = {}
             for eid in int4_experts:
-                # 取 INT4 权重：预量化（GPU 层）或懒量化（meta 层，forward 时 hook 已加载）
-                cache_key = (id(self.experts), eid)
-                if cache_key not in _LAZY_INT4_CACHE:
-                    need_lazy = (
-                        int4_gate_up is None or torch.isnan(int4_gate_up[eid]).any()
-                    )
-                    if need_lazy:
-                        # Meta 层首次命中：hook 已将权重加载到 GPU，量化丢 CPU 缓存
-                        w_g = self.experts.gate_up_proj.data[eid]
-                        w_d = self.experts.down_proj.data[eid]
-                        _LAZY_INT4_CACHE[cache_key] = (
-                            quantize_weight_to_int4(w_g).cpu(),
-                            quantize_weight_to_int4(w_d).cpu(),
-                        )
-                    else:
-                        _LAZY_INT4_CACHE[cache_key] = (
-                            int4_gate_up[eid],
-                            int4_down[eid],
-                        )
-                q_g, q_d = _LAZY_INT4_CACHE[cache_key]
+                q_g, q_d = int4_gate_up[eid], int4_down[eid]
 
-                # 备份原始 → CPU（clone 的 GPU 临时副本自动释放），替换为 INT4
+                # 备份原始到 CPU，替换为 INT4
                 orig_bak[eid] = (
                     self.experts.gate_up_proj.data[eid].clone().cpu(),
                     self.experts.down_proj.data[eid].clone().cpu(),
@@ -231,15 +208,100 @@ def make_hobbit_forward(stats, int4_gate_up, int4_down):
     return f
 
 
+def _load_meta_weights(model):
+    """从 safetensors 文件加载 meta 层的真实权重到 CPU，替换 meta tensor。"""
+    meta_layers = [
+        (idx, layer)
+        for idx, layer in enumerate(model.model.layers)
+        if layer.mlp.experts.gate_up_proj.is_meta
+    ]
+    if not meta_layers:
+        return
+
+    model_id = os.environ.get("LOCAL_MODEL_PATH", "").strip()
+    if not model_id:
+        model_id = "mistralai/Mixtral-8x7B-v0.1"
+    # 本地路径
+    model_path = os.path.expanduser(model_id) if "~" in model_id else model_id
+    if not os.path.isdir(model_path):
+        # 尝试 HOME
+        model_path = os.path.join(os.path.expanduser("~"), "models", "mixtral-8x7b")
+    if not os.path.isdir(model_path):
+        print(
+            f"[LOAD_META] Model path not found: {model_path}, skipping meta layer loading"
+        )
+        return
+
+    sf_files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
+    if not sf_files:
+        print(f"[LOAD_META] No safetensors files found in {model_path}")
+        return
+
+    from safetensors import safe_open
+
+    print(f"[LOAD_META] Loading {len(meta_layers)} meta layers from safetensors...")
+    for idx, layer in meta_layers:
+        experts = layer.mlp.experts
+        n_exp = experts.gate_up_proj.shape[0]
+        hidden_dim = experts.gate_up_proj.shape[-1]
+        intermediate_dim = experts.down_proj.shape[-1]
+
+        gate_up = torch.zeros(
+            n_exp,
+            2 * intermediate_dim,
+            hidden_dim,
+            device="cpu",
+            dtype=experts.gate_up_proj.dtype,
+        )
+        down = torch.zeros(
+            n_exp,
+            hidden_dim,
+            intermediate_dim,
+            device="cpu",
+            dtype=experts.down_proj.dtype,
+        )
+
+        # 扫描所有 shard，加载该层所有 expert 的 w1, w2, w3
+        for sf_path in sf_files:
+            with safe_open(sf_path, framework="pt", device="cpu") as f:
+                keys = list(f.keys())
+                for eid in range(n_exp):
+                    prefix = f"model.layers.{idx}.block_sparse_moe.experts.{eid}"
+                    w1_key = f"{prefix}.w1.weight"
+                    w2_key = f"{prefix}.w2.weight"
+                    w3_key = f"{prefix}.w3.weight"
+                    if w1_key in keys and w3_key in keys:
+                        w1 = f.get_tensor(w1_key)  # (intermediate, hidden)
+                        w3 = f.get_tensor(w3_key)
+                        gate_up[eid] = torch.cat([w1, w3], dim=0).to(
+                            dtype=experts.gate_up_proj.dtype
+                        )
+                    if w2_key in keys:
+                        down[eid] = f.get_tensor(w2_key).to(
+                            dtype=experts.down_proj.dtype
+                        )
+
+        # 替换 meta tensor 为真实权重
+        experts.gate_up_proj = nn.Parameter(gate_up)
+        experts.down_proj = nn.Parameter(down)
+        print(
+            f"[LOAD_META]   Layer {idx}: {n_exp} experts loaded ({gate_up.shape}, {down.shape})"
+        )
+
+    print(f"[LOAD_META] Done — {len(meta_layers)} layers materialized")
+
+
 def patch_hobbit(model):
-    """给模型缝上 HOBBIT：预计算 INT4 权重（GPU 层）+ meta 层懒量化"""
+    """给模型缝上 HOBBIT：预计算 INT4 权重（所有 32 层，meta 层从 safetensors 加载）"""
+    # 先物化 meta 层权重
+    _load_meta_weights(model)
+
     sample_moe = model.model.layers[0].mlp
     n_experts = sample_moe.experts.gate_up_proj.shape[0]
     dtype = sample_moe.experts.gate_up_proj.dtype
     hidden_dim = sample_moe.experts.gate_up_proj.shape[-1]
     intermediate_dim = sample_moe.experts.down_proj.shape[-1]
 
-    gpu_count, meta_count = 0, 0
     print(
         f"[HOBBIT] Pre-computing INT4 for {n_experts} experts x {len(model.model.layers)} layers..."
     )
@@ -248,29 +310,19 @@ def patch_hobbit(model):
 
     for layer_idx, layer in enumerate(model.model.layers):
         experts = layer.mlp.experts
-        is_meta = experts.gate_up_proj.is_meta
 
-        if is_meta:
-            # Meta 层：不预量化，传 None，forward 时懒量化
-            int4_gate_up = None
-            int4_down = None
-            meta_count += 1
-        else:
-            # GPU 层：预计算 INT4 放 CPU
-            int4_gate_up = torch.empty(
-                n_experts, 2 * intermediate_dim, hidden_dim, device="cpu", dtype=dtype
-            )
-            int4_down = torch.empty(
-                n_experts, hidden_dim, intermediate_dim, device="cpu", dtype=dtype
-            )
-            for eid in range(n_experts):
-                int4_gate_up[eid] = quantize_weight_to_int4(
-                    experts.gate_up_proj.data[eid]
-                ).cpu()
-                int4_down[eid] = quantize_weight_to_int4(
-                    experts.down_proj.data[eid]
-                ).cpu()
-            gpu_count += 1
+        # 所有层统一预量化（meta 层已被 _load_meta_weights 物化）
+        int4_gate_up = torch.empty(
+            n_experts, 2 * intermediate_dim, hidden_dim, device="cpu", dtype=dtype
+        )
+        int4_down = torch.empty(
+            n_experts, hidden_dim, intermediate_dim, device="cpu", dtype=dtype
+        )
+        for eid in range(n_experts):
+            int4_gate_up[eid] = quantize_weight_to_int4(
+                experts.gate_up_proj.data[eid]
+            ).cpu()
+            int4_down[eid] = quantize_weight_to_int4(experts.down_proj.data[eid]).cpu()
 
         if (layer_idx + 1) % 8 == 0:
             print(f"[HOBBIT]   Layer {layer_idx+1}/{len(model.model.layers)} processed")
@@ -282,8 +334,7 @@ def patch_hobbit(model):
         )
 
     print(
-        f"[HOBBIT] Patch complete — {gpu_count} GPU layers pre-quantized, "
-        f"{meta_count} CPU-offloaded (lazy INT4 on first use)"
+        f"[HOBBIT] Patch complete — {len(model.model.layers)} layers, all INT4 pre-quantized"
     )
 
     class HobbitStats:
