@@ -181,143 +181,184 @@ def make_hobbit_forward(stats, int4_gate_up, int4_down):
                     stats["skip"] += 1
                     modified_w[t, i] = 0.0
 
-        # === INT4 替换（32 层全覆盖，均已预量化） ===
+        # === INT4 替换：设置状态，让 _hobbit_experts_forward 处理 ===
         if int4_experts:
-            orig_bak = {}
-            for eid in int4_experts:
-                q_g, q_d = int4_gate_up[eid], int4_down[eid]
-
-                # 备份原始到 CPU，替换为 INT4
-                orig_bak[eid] = (
-                    self.experts.gate_up_proj.data[eid].clone().cpu(),
-                    self.experts.down_proj.data[eid].clone().cpu(),
-                )
-                self.experts.gate_up_proj.data[eid].copy_(q_g.to(device))
-                self.experts.down_proj.data[eid].copy_(q_d.to(device))
+            self.experts._hobbit_int4 = int4_experts
+            self.experts._hobbit_int4_weights = (int4_gate_up, int4_down, None)
 
         x = self.experts(x, top_k_index, modified_w)
 
+        # 清理状态
         if int4_experts:
-            for eid in int4_experts:
-                self.experts.gate_up_proj.data[eid].copy_(orig_bak[eid][0].to(device))
-                self.experts.down_proj.data[eid].copy_(orig_bak[eid][1].to(device))
+            self.experts._hobbit_int4 = set()
 
         return x.reshape(B, S, D)
 
     return f
 
 
-def _load_meta_weights(model):
-    """从 safetensors 文件加载 meta 层的真实权重到 CPU，替换 meta tensor。"""
+# 保存原始 MixtralExperts.forward，后续需要替换
+_ORIGINAL_EXPERTS_FORWARD = None
+
+
+def _patch_experts_forward():
+    """全局替换 MixtralExperts.forward，支持 HOBBIT INT4 权重注入。
+
+    HOBBIT 的 mlp.forward 在调用 self.experts() 前设置
+    self.experts._hobbit_int4 和 self.experts._hobbit_int4_weights，
+    此函数会读取并替换对应专家的权重。
+    """
+    global _ORIGINAL_EXPERTS_FORWARD
+    from transformers.models.mixtral.modeling_mixtral import MixtralExperts
+
+    if _ORIGINAL_EXPERTS_FORWARD is None:
+        _ORIGINAL_EXPERTS_FORWARD = MixtralExperts.forward
+
+    @torch.no_grad()
+    def _hobbit_forward(self, hidden_states, top_k_index, top_k_weights):
+        int4_set = getattr(self, "_hobbit_int4", None)
+        if not int4_set:
+            return _ORIGINAL_EXPERTS_FORWARD(self, hidden_states, top_k_index, top_k_weights)
+
+        # 获取 INT4 权重缓存
+        q_gateup, q_down, meta_cache = getattr(self, "_hobbit_int4_weights", (None, None, None))
+        device = hidden_states.device
+
+        final_hidden_states = torch.zeros_like(hidden_states)
+        with torch.no_grad():
+            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
+            expert_mask = expert_mask.permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+        for expert_idx in expert_hit:
+            expert_idx = expert_idx[0]
+            if expert_idx == self.num_experts:
+                continue
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            current_state = hidden_states[token_idx]
+
+            if expert_idx in int4_set:
+                # 使用 INT4 权重
+                if meta_cache and expert_idx in meta_cache:
+                    g, d = meta_cache[expert_idx]
+                else:
+                    g, d = q_gateup[expert_idx], q_down[expert_idx]
+                gate, up = nn.functional.linear(current_state, g.to(device)).chunk(2, dim=-1)
+                current_hidden_states = self.act_fn(gate) * up
+                current_hidden_states = nn.functional.linear(
+                    current_hidden_states, d.to(device)
+                )
+            else:
+                # 原始 FP16（此时 hooks 已物化权重）
+                gate, up = nn.functional.linear(
+                    current_state, self.gate_up_proj[expert_idx]
+                ).chunk(2, dim=-1)
+                current_hidden_states = self.act_fn(gate) * up
+                current_hidden_states = nn.functional.linear(
+                    current_hidden_states, self.down_proj[expert_idx]
+                )
+
+            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+            final_hidden_states.index_add_(
+                0, token_idx, current_hidden_states.to(final_hidden_states.dtype)
+            )
+
+        return final_hidden_states
+
+    MixtralExperts.forward = _hobbit_forward
+
+
+def _load_meta_int4(model):
+    """从 safetensors 读取 meta 层权重，直接预量化为 INT4 并返回缓存。
+
+    不修改模型参数（meta tensor 不可写），只返回供 _hobbit_forward 使用的 INT4 权重。
+    """
     meta_layers = [
-        (idx, layer)
-        for idx, layer in enumerate(model.model.layers)
+        (idx, layer) for idx, layer in enumerate(model.model.layers)
         if layer.mlp.experts.gate_up_proj.is_meta
     ]
     if not meta_layers:
-        return
+        return {}
 
     model_id = os.environ.get("LOCAL_MODEL_PATH", "").strip()
     if not model_id:
         model_id = "mistralai/Mixtral-8x7B-v0.1"
-    # 本地路径
     model_path = os.path.expanduser(model_id) if "~" in model_id else model_id
     if not os.path.isdir(model_path):
-        # 尝试 HOME
         model_path = os.path.join(os.path.expanduser("~"), "models", "mixtral-8x7b")
     if not os.path.isdir(model_path):
-        print(
-            f"[LOAD_META] Model path not found: {model_path}, skipping meta layer loading"
-        )
-        return
+        print(f"[LOAD_META] Model path not found: {model_path}")
+        return {}
 
     sf_files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
     if not sf_files:
-        print(f"[LOAD_META] No safetensors files found in {model_path}")
-        return
+        return {}
 
     from safetensors import safe_open
+    cache = {}  # {expert_id: (int4_gate, int4_down)} on CPU
 
-    print(f"[LOAD_META] Loading {len(meta_layers)} meta layers from safetensors...")
+    print(f"[LOAD_META] Loading & quantizing {len(meta_layers)} meta layers...")
     for idx, layer in meta_layers:
-        experts = layer.mlp.experts
-        n_exp = experts.gate_up_proj.shape[0]
-        hidden_dim = experts.gate_up_proj.shape[-1]
-        intermediate_dim = experts.down_proj.shape[-1]
+        exp = layer.mlp.experts
+        n_exp = exp.gate_up_proj.shape[0]
+        hidden_dim = exp.gate_up_proj.shape[-1]
+        intermediate_dim = exp.down_proj.shape[-1]
 
-        gate_up = torch.zeros(
-            n_exp,
-            2 * intermediate_dim,
-            hidden_dim,
-            device="cpu",
-            dtype=torch.bfloat16,  # 与 safetensors 文件一致
-        )
-        down = torch.zeros(
-            n_exp,
-            hidden_dim,
-            intermediate_dim,
-            device="cpu",
-            dtype=torch.bfloat16,
-        )
-
-        # 扫描所有 shard，加载该层所有 expert 的 w1, w2, w3
         for sf_path in sf_files:
             with safe_open(sf_path, framework="pt", device="cpu") as f:
                 keys = list(f.keys())
                 for eid in range(n_exp):
+                    key = (idx, eid)
+                    if key in cache:
+                        continue
                     prefix = f"model.layers.{idx}.block_sparse_moe.experts.{eid}"
-                    w1_key = f"{prefix}.w1.weight"
-                    w2_key = f"{prefix}.w2.weight"
-                    w3_key = f"{prefix}.w3.weight"
-                    if w1_key in keys and w3_key in keys:
-                        w1 = f.get_tensor(w1_key)  # (intermediate, hidden), bfloat16
-                        w3 = f.get_tensor(w3_key)
-                        gate_up[eid] = torch.cat([w1, w3], dim=0)
-                    if w2_key in keys:
-                        down[eid] = f.get_tensor(w2_key)
+                    w1k, w2k, w3k = f"{prefix}.w1.weight", f"{prefix}.w2.weight", f"{prefix}.w3.weight"
+                    if w1k in keys and w3k in keys:
+                        w1, w3 = f.get_tensor(w1k), f.get_tensor(w3k)
+                        gate_up = torch.cat([w1, w3], dim=0).to(torch.bfloat16)
+                        w2 = f.get_tensor(w2k).to(torch.bfloat16)
+                        # 直接预量化到 INT4
+                        qg = quantize_weight_to_int4(gate_up)
+                        qd = quantize_weight_to_int4(w2)
+                        cache[key] = (qg.cpu(), qd.cpu())
 
-        # 替换 meta tensor 为真实 cpu 权重（直接操作 _parameters 字典绕过 set_data 设备检查）
-        experts._parameters["gate_up_proj"] = nn.Parameter(gate_up)
-        experts._parameters["down_proj"] = nn.Parameter(down)
-        print(
-            f"[LOAD_META]   Layer {idx}: {n_exp} experts loaded ({gate_up.shape}, {down.shape})"
-        )
+        layer_key_count = sum(1 for k in cache if k[0] == idx)
+        if layer_key_count > 0:
+            print(f"[LOAD_META]   Layer {idx}: {layer_key_count} experts INT4 cached")
 
-    print(f"[LOAD_META] Done — {len(meta_layers)} layers materialized")
+    print(f"[LOAD_META] Done — {len(cache)} experts cached")
+    return cache
 
 
 def patch_hobbit(model):
-    """给模型缝上 HOBBIT：预计算 INT4 权重（所有 32 层，meta 层从 safetensors 加载）"""
-    # 先物化 meta 层权重
-    _load_meta_weights(model)
+    """给模型缝上 HOBBIT：预计算 INT4 权重 + 替换专家前向。"""
+    # 全局替换 MixtralExperts.forward
+    _patch_experts_forward()
 
-    sample_moe = model.model.layers[0].mlp
-    n_experts = sample_moe.experts.gate_up_proj.shape[0]
-    dtype = sample_moe.experts.gate_up_proj.dtype
-    hidden_dim = sample_moe.experts.gate_up_proj.shape[-1]
-    intermediate_dim = sample_moe.experts.down_proj.shape[-1]
+    # 加载 meta 层的 INT4 权重（不碰模型参数）
+    meta_int4 = _load_meta_int4(model)
 
-    print(
-        f"[HOBBIT] Pre-computing INT4 for {n_experts} experts x {len(model.model.layers)} layers..."
-    )
+    n_experts = model.model.layers[0].mlp.experts.gate_up_proj.shape[0]
+    dtype = model.model.layers[0].mlp.experts.gate_up_proj.dtype
+    hidden_dim = model.model.layers[0].mlp.experts.gate_up_proj.shape[-1]
+    intermediate_dim = model.model.layers[0].mlp.experts.down_proj.shape[-1]
 
+    print(f"[HOBBIT] Pre-computing INT4 for {n_experts} experts x {len(model.model.layers)} layers...")
     layer_stats = []
 
     for layer_idx, layer in enumerate(model.model.layers):
         experts = layer.mlp.experts
 
-        # 所有层统一预量化（meta 层已被 _load_meta_weights 物化）
-        int4_gate_up = torch.empty(
-            n_experts, 2 * intermediate_dim, hidden_dim, device="cpu", dtype=dtype
-        )
-        int4_down = torch.empty(
-            n_experts, hidden_dim, intermediate_dim, device="cpu", dtype=dtype
-        )
+        # GPU 层：预计算 INT4（meta 层走 _load_meta_int4）
+        int4_gate_up = torch.empty(n_experts, 2 * intermediate_dim, hidden_dim, device="cpu", dtype=dtype)
+        int4_down = torch.empty(n_experts, hidden_dim, intermediate_dim, device="cpu", dtype=dtype)
         for eid in range(n_experts):
-            int4_gate_up[eid] = quantize_weight_to_int4(
-                experts.gate_up_proj.data[eid]
-            ).cpu()
-            int4_down[eid] = quantize_weight_to_int4(experts.down_proj.data[eid]).cpu()
+            key = (layer_idx, eid)
+            if key in meta_int4:
+                int4_gate_up[eid], int4_down[eid] = meta_int4[key]
+            else:
+                int4_gate_up[eid] = quantize_weight_to_int4(experts.gate_up_proj.data[eid]).cpu()
+                int4_down[eid] = quantize_weight_to_int4(experts.down_proj.data[eid]).cpu()
 
         if (layer_idx + 1) % 8 == 0:
             print(f"[HOBBIT]   Layer {layer_idx+1}/{len(model.model.layers)} processed")
@@ -328,9 +369,8 @@ def patch_hobbit(model):
             layer.mlp, type(layer.mlp)
         )
 
-    print(
-        f"[HOBBIT] Patch complete — {len(model.model.layers)} layers, all INT4 pre-quantized"
-    )
+    print(f"[HOBBIT] Patch complete — {len(model.model.layers)} layers")
+    # 返回可聚合的 stats 对象
 
     class HobbitStats:
         def __init__(self, stats_list):
