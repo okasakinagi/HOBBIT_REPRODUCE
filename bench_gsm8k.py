@@ -175,8 +175,12 @@ def make_hobbit_forward(stats, int4_gate_up, int4_down):
                 if score <= HOBBIT_CONFIG["T1"]:
                     stats["hit" if eid in stats["cache"] else "miss"] += 1
                 elif score <= HOBBIT_CONFIG["T2"]:
-                    stats["int4"] += 1
-                    int4_experts.add(eid)
+                    # INT4 权重不可用（NaN）时回退到 FP16
+                    if not torch.isnan(int4_gate_up[eid]).any():
+                        stats["int4"] += 1
+                        int4_experts.add(eid)
+                    else:
+                        stats["hit" if eid in stats["cache"] else "miss"] += 1
                 else:
                     stats["skip"] += 1
                     modified_w[t, i] = 0.0
@@ -218,15 +222,21 @@ def _patch_experts_forward():
     def _hobbit_forward(self, hidden_states, top_k_index, top_k_weights):
         int4_set = getattr(self, "_hobbit_int4", None)
         if not int4_set:
-            return _ORIGINAL_EXPERTS_FORWARD(self, hidden_states, top_k_index, top_k_weights)
+            return _ORIGINAL_EXPERTS_FORWARD(
+                self, hidden_states, top_k_index, top_k_weights
+            )
 
         # 获取 INT4 权重缓存
-        q_gateup, q_down, meta_cache = getattr(self, "_hobbit_int4_weights", (None, None, None))
+        q_gateup, q_down, meta_cache = getattr(
+            self, "_hobbit_int4_weights", (None, None, None)
+        )
         device = hidden_states.device
 
         final_hidden_states = torch.zeros_like(hidden_states)
         with torch.no_grad():
-            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
+            expert_mask = torch.nn.functional.one_hot(
+                top_k_index, num_classes=self.num_experts
+            )
             expert_mask = expert_mask.permute(2, 1, 0)
             expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
 
@@ -243,7 +253,9 @@ def _patch_experts_forward():
                     g, d = meta_cache[expert_idx]
                 else:
                     g, d = q_gateup[expert_idx], q_down[expert_idx]
-                gate, up = nn.functional.linear(current_state, g.to(device)).chunk(2, dim=-1)
+                gate, up = nn.functional.linear(current_state, g.to(device)).chunk(
+                    2, dim=-1
+                )
                 current_hidden_states = self.act_fn(gate) * up
                 current_hidden_states = nn.functional.linear(
                     current_hidden_states, d.to(device)
@@ -258,7 +270,9 @@ def _patch_experts_forward():
                     current_hidden_states, self.down_proj[expert_idx]
                 )
 
-            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+            current_hidden_states = (
+                current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+            )
             final_hidden_states.index_add_(
                 0, token_idx, current_hidden_states.to(final_hidden_states.dtype)
             )
@@ -274,7 +288,8 @@ def _load_meta_int4(model):
     不修改模型参数（meta tensor 不可写），只返回供 _hobbit_forward 使用的 INT4 权重。
     """
     meta_layers = [
-        (idx, layer) for idx, layer in enumerate(model.model.layers)
+        (idx, layer)
+        for idx, layer in enumerate(model.model.layers)
         if layer.mlp.experts.gate_up_proj.is_meta
     ]
     if not meta_layers:
@@ -295,6 +310,7 @@ def _load_meta_int4(model):
         return {}
 
     from safetensors import safe_open
+
     cache = {}  # {expert_id: (int4_gate, int4_down)} on CPU
 
     print(f"[LOAD_META] Loading & quantizing {len(meta_layers)} meta layers...")
@@ -312,7 +328,11 @@ def _load_meta_int4(model):
                     if key in cache:
                         continue
                     prefix = f"model.layers.{idx}.block_sparse_moe.experts.{eid}"
-                    w1k, w2k, w3k = f"{prefix}.w1.weight", f"{prefix}.w2.weight", f"{prefix}.w3.weight"
+                    w1k, w2k, w3k = (
+                        f"{prefix}.w1.weight",
+                        f"{prefix}.w2.weight",
+                        f"{prefix}.w3.weight",
+                    )
                     if w1k in keys and w3k in keys:
                         w1, w3 = f.get_tensor(w1k), f.get_tensor(w3k)
                         gate_up = torch.cat([w1, w3], dim=0).to(torch.bfloat16)
@@ -343,22 +363,36 @@ def patch_hobbit(model):
     hidden_dim = model.model.layers[0].mlp.experts.gate_up_proj.shape[-1]
     intermediate_dim = model.model.layers[0].mlp.experts.down_proj.shape[-1]
 
-    print(f"[HOBBIT] Pre-computing INT4 for {n_experts} experts x {len(model.model.layers)} layers...")
+    print(
+        f"[HOBBIT] Pre-computing INT4 for {n_experts} experts x {len(model.model.layers)} layers..."
+    )
     layer_stats = []
 
     for layer_idx, layer in enumerate(model.model.layers):
         experts = layer.mlp.experts
+        is_meta = experts.gate_up_proj.is_meta
 
-        # GPU 层：预计算 INT4（meta 层走 _load_meta_int4）
-        int4_gate_up = torch.empty(n_experts, 2 * intermediate_dim, hidden_dim, device="cpu", dtype=dtype)
-        int4_down = torch.empty(n_experts, hidden_dim, intermediate_dim, device="cpu", dtype=dtype)
+        int4_gate_up = torch.empty(
+            n_experts, 2 * intermediate_dim, hidden_dim, device="cpu", dtype=dtype
+        )
+        int4_down = torch.empty(
+            n_experts, hidden_dim, intermediate_dim, device="cpu", dtype=dtype
+        )
         for eid in range(n_experts):
             key = (layer_idx, eid)
             if key in meta_int4:
                 int4_gate_up[eid], int4_down[eid] = meta_int4[key]
+            elif is_meta:
+                # Meta 层但 expert 未缓存（shard 拆分缺失），NaN 表示跳过 INT4
+                int4_gate_up[eid] = float("nan")
+                int4_down[eid] = float("nan")
             else:
-                int4_gate_up[eid] = quantize_weight_to_int4(experts.gate_up_proj.data[eid]).cpu()
-                int4_down[eid] = quantize_weight_to_int4(experts.down_proj.data[eid]).cpu()
+                int4_gate_up[eid] = quantize_weight_to_int4(
+                    experts.gate_up_proj.data[eid]
+                ).cpu()
+                int4_down[eid] = quantize_weight_to_int4(
+                    experts.down_proj.data[eid]
+                ).cpu()
 
         if (layer_idx + 1) % 8 == 0:
             print(f"[HOBBIT]   Layer {layer_idx+1}/{len(model.model.layers)} processed")
