@@ -317,30 +317,38 @@ def _load_meta_int4(model):
     for idx, layer in meta_layers:
         exp = layer.mlp.experts
         n_exp = exp.gate_up_proj.shape[0]
-        hidden_dim = exp.gate_up_proj.shape[-1]
-        intermediate_dim = exp.down_proj.shape[-1]
 
+        # 第一遍：收集每个 expert 的 w1/w2/w3 在哪个 shard
+        w1_loc, w2_loc, w3_loc = {}, {}, {}
         for sf_path in sf_files:
             with safe_open(sf_path, framework="pt", device="cpu") as f:
                 keys = list(f.keys())
                 for eid in range(n_exp):
-                    key = (idx, eid)
-                    if key in cache:
-                        continue
                     prefix = f"model.layers.{idx}.block_sparse_moe.experts.{eid}"
-                    w1k, w2k, w3k = (
-                        f"{prefix}.w1.weight",
-                        f"{prefix}.w2.weight",
-                        f"{prefix}.w3.weight",
-                    )
-                    if w1k in keys and w3k in keys:
-                        w1, w3 = f.get_tensor(w1k), f.get_tensor(w3k)
-                        gate_up = torch.cat([w1, w3], dim=0).to(torch.bfloat16)
-                        w2 = f.get_tensor(w2k).to(torch.bfloat16)
-                        # 直接预量化到 INT4
-                        qg = quantize_weight_to_int4(gate_up)
-                        qd = quantize_weight_to_int4(w2)
-                        cache[key] = (qg.cpu(), qd.cpu())
+                    w1k, w2k, w3k = f"{prefix}.w1.weight", f"{prefix}.w2.weight", f"{prefix}.w3.weight"
+                    if w1k in keys: w1_loc[eid] = sf_path
+                    if w2k in keys: w2_loc[eid] = sf_path
+                    if w3k in keys: w3_loc[eid] = sf_path
+
+        # 第二遍：加载并量化（w1/w3 可能在相同或不同 shard）
+        def _load_tensor(path, key):
+            with safe_open(path, framework="pt", device="cpu") as f:
+                return f.get_tensor(key).to(torch.bfloat16)
+
+        for eid in range(n_exp):
+            prefix = f"model.layers.{idx}.block_sparse_moe.experts.{eid}"
+            if eid not in w1_loc or eid not in w3_loc:
+                print(f"[LOAD_META]   Layer {idx}: expert {eid} missing w1/w3, skipped")
+                continue
+            w1 = _load_tensor(w1_loc[eid], f"{prefix}.w1.weight")
+            w3 = _load_tensor(w3_loc[eid], f"{prefix}.w3.weight")
+            gate_up = torch.cat([w1, w3], dim=0)
+            w2 = _load_tensor(w2_loc[eid], f"{prefix}.w2.weight") if eid in w2_loc else None
+            if w2 is None:
+                print(f"[LOAD_META]   Layer {idx}: expert {eid} missing w2, skipped")
+                continue
+            cache[(idx, eid)] = (quantize_weight_to_int4(gate_up).cpu(),
+                                 quantize_weight_to_int4(w2).cpu())
 
         layer_key_count = sum(1 for k in cache if k[0] == idx)
         if layer_key_count > 0:
