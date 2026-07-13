@@ -2,19 +2,22 @@
 bench_mmlu.py — MMLU 精度评测
 ===============================
 在 HOBBIT 缝合版 Mixtral 上跑 MMLU 选择题评测。
-利用选择题特性：单次前向传播后比较 A/B/C/D 的概率，无需逐 token 生成。
+支持真实 bitsandbytes NF4 量化 + Skip，与 bench_gsm8k.py 共享 HOBBIT 核心。
 
-用法（服务器上）：
-    HF_ENDPOINT=https://hf-mirror.com \
+用法（服务器 nohup 推荐）：
     LOCAL_MODEL_PATH=~/models/mixtral-8x7b \
-    python bench_mmlu.py 2>&1 | tee ../logs/mmlu_$(date +%Y%m%d_%H%M%S).log
+        nohup python bench_mmlu.py --mode baseline > ../logs/mmlu_bl_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+
+    LOCAL_MODEL_PATH=~/models/mixtral-8x7b \
+        nohup python bench_mmlu.py --mode hobbit > ../logs/mmlu_hb_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 
 可选参数：
-    MMLU_SUBJECTS=high_school_physics,high_school_mathematics,professional_law
-    MMLU_MAX_QUESTIONS=50  # 每个学科最多做多少题
+    --mode baseline|hobbit  评测模式（必选）
+    MMLU_SUBJECTS=physics,math,law  学科（逗号分隔）
+    MMLU_MAX_QUESTIONS=50  每个学科最多多少题（默认全部）
 """
 
-import sys, os, time
+import sys, os, time, argparse
 
 os.environ["HF_HUB_ENABLE_HF_XET"] = "0"
 if not os.environ.get("HF_ENDPOINT"):
@@ -23,10 +26,15 @@ if not os.environ.get("HF_ENDPOINT"):
 import torch
 from transformers import MixtralForCausalLM, AutoTokenizer
 
-# ============================================================
-# 配置
-# ============================================================
-HOBBIT_CONFIG = {"T1": 0.6, "T2": 0.9}
+# 从 bench_gsm8k.py 导入 HOBBIT 核心
+from bench_gsm8k import (
+    HOBBIT_CONFIG,
+    quantize_weight_to_int4,
+    _patch_experts_forward,
+    _load_meta_int4,
+    patch_hobbit,
+)
+
 SUBJECTS = os.environ.get(
     "MMLU_SUBJECTS", "high_school_physics,high_school_mathematics,professional_law"
 ).split(",")
@@ -34,42 +42,15 @@ _mq = os.environ.get("MMLU_MAX_QUESTIONS", "")
 MAX_Q = int(_mq) if _mq else 9999
 
 
-def make_hobbit_forward(stats):
-    """和 server_hobbit.py 完全一致的 HOBBIT 猴子补丁"""
-
-    def f(self, hidden_states):
-        B, S, D = hidden_states.shape
-        x = hidden_states.view(-1, D)
-        _, top_k_weights, top_k_index = self.gate(x)
-        idx_cpu = top_k_index.cpu().numpy()
-        w_cpu = top_k_weights.cpu().numpy()
-        for t in range(B * S):
-            tw = w_cpu[t].sum()
-            cum = 0.0
-            for i in range(len(idx_cpu[t])):
-                eid = int(idx_cpu[t][i])
-                score = 0.0 if i == 0 else cum / tw
-                cum += w_cpu[t][i - 1] if i > 0 else 0
-                if score <= HOBBIT_CONFIG["T1"]:
-                    stats["hit" if eid in stats["cache"] else "miss"] += 1
-                elif score <= HOBBIT_CONFIG["T2"]:
-                    stats["int4"] += 1
-                else:
-                    stats["skip"] += 1
-        x = self.experts(x, top_k_index, top_k_weights)
-        return x.reshape(B, S, D)
-
-    return f
-
-
-def load_model_with_hobbit():
+def load_model():
+    """加载 Mixtral-8x7B（和 bench_gsm8k.py 一致）"""
     model_id = os.environ.get("LOCAL_MODEL_PATH", "").strip()
     local = bool(model_id)
     if not model_id:
         model_id = "mistralai/Mixtral-8x7B-v0.1"
 
     n_gpus = torch.cuda.device_count()
-    print(f"[MMLU] Loading model...")
+    print(f"[MMLU] Loading model ({'local' if local else 'hub'})...")
     model = MixtralForCausalLM.from_pretrained(
         model_id,
         torch_dtype=torch.bfloat16,
@@ -80,12 +61,6 @@ def load_model_with_hobbit():
         low_cpu_mem_usage=True,
         local_files_only=local,
     )
-
-    # 缝合 HOBBIT
-    for layer in model.model.layers:
-        s = {"hit": 0, "miss": 0, "int4": 0, "skip": 0, "cache": {0, 1}}
-        layer.mlp.forward = make_hobbit_forward(s).__get__(layer.mlp, type(layer.mlp))
-
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     tokenizer.pad_token = tokenizer.eos_token
     return model, tokenizer
@@ -104,14 +79,12 @@ def format_mmlu_prompt(question, choices, subject=""):
 
 def evaluate_subject(model, tokenizer, subject, device):
     print(f"\n[MMLU] Subject: {subject}")
-    # 从本地 JSON 加载（预先下载好的 MMLU 数据）
     import json
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     json_path = os.path.join(script_dir, "data", f"mmlu_{subject}.json")
     if not os.path.exists(json_path):
         print(f"[MMLU]   File not found: {json_path}")
-        print(f"[MMLU]   CWD: {os.getcwd()}")
         return 0.0
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -133,7 +106,6 @@ def evaluate_subject(model, tokenizer, subject, device):
         with torch.no_grad():
             out = model(**inp)
 
-        # 取最后一个 token 的 logits，比较 A/B/C/D 概率
         last_logits = out.logits[0, -1, :]
         probs = {l: last_logits[tid].item() for l, tid in letter_ids.items()}
         pred = max(probs, key=probs.get)
@@ -155,11 +127,22 @@ def evaluate_subject(model, tokenizer, subject, device):
 
 
 def main():
-    model, tokenizer = load_model_with_hobbit()
+    parser = argparse.ArgumentParser(description="MMLU Evaluation")
+    parser.add_argument(
+        "--mode", choices=["baseline", "hobbit"], required=True,
+        help="baseline (全FP16) 或 hobbit (混合精度)"
+    )
+    args = parser.parse_args()
+
+    model, tokenizer = load_model()
     device = model.device
 
+    hobbit_stats = None
+    if args.mode == "hobbit":
+        hobbit_stats = patch_hobbit(model)
+
     print(f"\n{'='*60}")
-    print(f"MMLU Evaluation — HOBBIT Mixed Precision")
+    print(f"MMLU Evaluation — Mode: {args.mode.upper()}")
     print(f"Subjects: {SUBJECTS}")
     print(f"{'='*60}")
 
@@ -170,7 +153,7 @@ def main():
 
     total_time = time.time() - t0
     print(f"\n{'='*60}")
-    print(f"Summary:")
+    print(f"Summary ({args.mode.upper()}):")
     print(f"{'Subject':<35} {'Accuracy':>10}")
     print(f"{'-'*47}")
     avg_acc = 0
@@ -181,7 +164,18 @@ def main():
     print(f"{'-'*47}")
     print(f"{'Average':<35} {avg_acc:>9.1f}%")
     print(f"Total time: {total_time/60:.1f} min")
-    print(f"[MMLU] DONE")
+
+    if hobbit_stats:
+        agg = hobbit_stats.aggregate()
+        total_calls = sum(agg[k] for k in agg if k != "cache")
+        print(f"\n[HOBBIT Stats]")
+        print(f"  FP16 hit:  {agg['hit']:>6} ({agg['hit']/total_calls*100:5.1f}%)")
+        print(f"  FP16 miss: {agg['miss']:>6} ({agg['miss']/total_calls*100:5.1f}%)")
+        print(f"  INT4:      {agg['int4']:>6} ({agg['int4']/total_calls*100:5.1f}%)")
+        print(f"  Skip:      {agg['skip']:>6} ({agg['skip']/total_calls*100:5.1f}%)")
+        print(f"  INT4+Skip: {(agg['int4']+agg['skip'])/total_calls*100:.1f}% of calls")
+
+    print(f"\n[MMLU] DONE")
 
 
 if __name__ == "__main__":
