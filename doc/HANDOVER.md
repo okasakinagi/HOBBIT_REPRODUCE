@@ -80,7 +80,7 @@ g:\moe\
 │   ├── 4.3 HOBBIT吞吐量 → pp 177 t/s               │
 │   ├── 4.4 真实混合精度 → cos 0.9998, 50%节省       │
 │   ├── 4.5 GSM8K baseline → 35.0% (20题)           │
-│   └── 4.6 GSM8K HOBBIT (bnb NF4 + skip)           🔄
+│   └── 4.6 GSM8K HOBBIT (bnb NF4 + skip)           ✅ 30.0%
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -227,16 +227,28 @@ bfloat16 + CPU offload（层 28-31 在 CPU），HOBBIT 决策逻辑开启：
 
 > HOBBIT 模式下的 MMLU 评测暂未执行。bench_mmlu.py 的 `make_hobbit_forward` 仍是旧版"只计数"逻辑，需同步更新为真正的 INT4 替换 + skip 后才有意义。
 
-#### 4.5 GSM8K 精度评测（进行中）
+#### 4.5 GSM8K 精度评测（已完成）
 
 **脚本：** `bench_gsm8k.py`（支持 checkpoint + 断点续跑）
 
-| 模式 | 20题准确率 | 状态 |
-|------|-----------|------|
-| Baseline (FP16) | 35.0% (7/20) | ✅ 完成 |
-| HOBBIT (bnb NF4 + skip) | ? | 🔄 跑完中 |
+| 模式 | 20题准确率 | 正确题号 |
+|------|-----------|---------|
+| Baseline (FP16) | **35.0%** (7/20) | 0,1,3,6,9,10,16 |
+| **HOBBIT (bnb NF4 + skip)** | **30.0%** (6/20) | 0,3,6,9,10,16 |
+| 差异 | **-5.0%** (差1题) | — |
 
 > 提取答案时遇到 `"18."` vs `"18"` 的小数点误判问题，已修复并提供了 `tools/re_eval_gsm8k.py` 重评工具。
+>
+> HOBBIT 统计：34.2% 专家调用被降级（31.0% INT4 + 3.2% Skip），均为真实 bitsandbytes NF4 量化。7 层 CPU-offloaded 专家通过 safetensors 读取权重后量化，32 层全覆盖。
+
+**架构演进记录：**
+
+| 版本 | 方法 | 状态 |
+|------|------|------|
+| V1 | 只计数，不修改计算 | ❌ baseline=HOBBIT |
+| V2 | 替换 `param.data` 做 INT4 swap | ❌ meta tensor 不可写 |
+| V3 | 替换 `_parameters` 字典 | ❌ hooks 不识别 |
+| V4 | 从 safetensors 加载+量化，挂钩 `MixtralExperts.forward` | ✅ 成功 |
 
 3 学科 551 题，0-shot，平均 43.6%。当前 HOBBIT 未替换 INT4 实际计算，准确率等同全精度基线。
 

@@ -325,10 +325,17 @@ def _load_meta_int4(model):
                 keys = list(f.keys())
                 for eid in range(n_exp):
                     prefix = f"model.layers.{idx}.block_sparse_moe.experts.{eid}"
-                    w1k, w2k, w3k = f"{prefix}.w1.weight", f"{prefix}.w2.weight", f"{prefix}.w3.weight"
-                    if w1k in keys: w1_loc[eid] = sf_path
-                    if w2k in keys: w2_loc[eid] = sf_path
-                    if w3k in keys: w3_loc[eid] = sf_path
+                    w1k, w2k, w3k = (
+                        f"{prefix}.w1.weight",
+                        f"{prefix}.w2.weight",
+                        f"{prefix}.w3.weight",
+                    )
+                    if w1k in keys:
+                        w1_loc[eid] = sf_path
+                    if w2k in keys:
+                        w2_loc[eid] = sf_path
+                    if w3k in keys:
+                        w3_loc[eid] = sf_path
 
         # 第二遍：加载并量化（w1/w3 可能在相同或不同 shard）
         def _load_tensor(path, key):
@@ -343,12 +350,18 @@ def _load_meta_int4(model):
             w1 = _load_tensor(w1_loc[eid], f"{prefix}.w1.weight")
             w3 = _load_tensor(w3_loc[eid], f"{prefix}.w3.weight")
             gate_up = torch.cat([w1, w3], dim=0)
-            w2 = _load_tensor(w2_loc[eid], f"{prefix}.w2.weight") if eid in w2_loc else None
+            w2 = (
+                _load_tensor(w2_loc[eid], f"{prefix}.w2.weight")
+                if eid in w2_loc
+                else None
+            )
             if w2 is None:
                 print(f"[LOAD_META]   Layer {idx}: expert {eid} missing w2, skipped")
                 continue
-            cache[(idx, eid)] = (quantize_weight_to_int4(gate_up).cpu(),
-                                 quantize_weight_to_int4(w2).cpu())
+            cache[(idx, eid)] = (
+                quantize_weight_to_int4(gate_up).cpu(),
+                quantize_weight_to_int4(w2).cpu(),
+            )
 
         layer_key_count = sum(1 for k in cache if k[0] == idx)
         if layer_key_count > 0:

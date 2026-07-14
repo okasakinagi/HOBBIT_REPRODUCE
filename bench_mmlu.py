@@ -129,8 +129,10 @@ def evaluate_subject(model, tokenizer, subject, device):
 def main():
     parser = argparse.ArgumentParser(description="MMLU Evaluation")
     parser.add_argument(
-        "--mode", choices=["baseline", "hobbit"], required=True,
-        help="baseline (全FP16) 或 hobbit (混合精度)"
+        "--mode",
+        choices=["baseline", "hobbit"],
+        required=True,
+        help="baseline (全FP16) 或 hobbit (混合精度)",
     )
     args = parser.parse_args()
 

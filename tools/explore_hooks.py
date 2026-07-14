@@ -2,16 +2,21 @@
 explore_hooks.py — 探查 meta 层的 hooks 机制
 在服务器上运行：python tools/explore_hooks.py
 """
+
 import os, sys
+
 os.environ["HF_HUB_ENABLE_HF_XET"] = "0"
 import torch
 from transformers import MixtralForCausalLM
 
 model_id = os.environ.get("LOCAL_MODEL_PATH", "~/models/mixtral-8x7b")
 model = MixtralForCausalLM.from_pretrained(
-    model_id, torch_dtype=torch.bfloat16, device_map="auto",
+    model_id,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
     max_memory={0: "40GB", 1: "40GB", "cpu": "200GB"},
-    low_cpu_mem_usage=True, local_files_only=True,
+    low_cpu_mem_usage=True,
+    local_files_only=True,
 )
 
 for i in [0, 25]:
@@ -32,11 +37,13 @@ for i in [0, 25]:
                         sample_key = list(val.keys())[0]
                         sample_val = val[sample_key]
                         print(f"      sample key: {sample_key}")
-                        if hasattr(sample_val, 'shape'):
-                            print(f"      sample val: shape={sample_val.shape}, device={sample_val.device}")
+                        if hasattr(sample_val, "shape"):
+                            print(
+                                f"      sample val: shape={sample_val.shape}, device={sample_val.device}"
+                            )
                         else:
                             print(f"      sample val type: {type(sample_val).__name__}")
-                elif hasattr(val, 'shape'):
+                elif hasattr(val, "shape"):
                     print(f"    {attr}: tensor shape={val.shape}, device={val.device}")
                 elif val is not None:
                     print(f"    {attr}: {type(val).__name__} = {str(val)[:80]}")
@@ -49,7 +56,9 @@ model_path = os.path.expanduser("~/models/mixtral-8x7b")
 import glob
 
 # 找 tensor 名
-layer25_param_names = [n for n, p in model.model.layers[25].mlp.experts.named_parameters()]
+layer25_param_names = [
+    n for n, p in model.model.layers[25].mlp.experts.named_parameters()
+]
 print(f"Layer 25 experts param names: {layer25_param_names}")
 
 # 找 safetensors 文件
@@ -58,6 +67,7 @@ print(f"Safetensors files: {[os.path.basename(f) for f in sf_files]}")
 
 # 直接在 safetensors 中搜索包含 layer 25 的 key
 from safetensors import safe_open
+
 print("Searching for layer 25 tensors in safetensors files...")
 for sf_path in sf_files:
     fname = os.path.basename(sf_path)
@@ -75,4 +85,3 @@ for sf_path in sf_files:
             for k in keys[:5]:
                 t = f.get_tensor(k)
                 print(f"    {k}: shape={t.shape}")
-
